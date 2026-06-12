@@ -1,0 +1,37 @@
+# Insty Project Configuration
+
+[project]
+name = "@ecx/vec2"
+version = "0.1.0"
+description = "Integer 2D vector math: add, sub, dot, cross, length_sq, distances"
+authors = ["ecx"]
+license = "MIT"
+main = "src/vec2.ins"
+module = "vec2"
+
+[compiler]
+optimization_level = 0
+ast_optimization = true
+output_format = "executable"
+debug_info = true
+
+[paths]
+module_search_paths = [".", "src"]
+output_dir = ".cloud/objects"
+
+[features]
+enable_imports = true
+enable_nested_functions = true
+enable_builtins = true
+enable_syscalls = true
+enable_pointers = true
+enable_structs = true
+enable_enums = true
+
+[diagnostics]
+error_verbosity = "normal"
+show_error_context = true
+colored_output = true
+
+[dependencies]
+# "@owner/package" = "^1.0.0"

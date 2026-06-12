@@ -1,0 +1,120 @@
+module ringbuf
+
+// @ecx/ringbuf — a fixed-capacity circular buffer of i64 values.
+//
+// Capacity is a compile-time constant (64 slots) and no heap is used, so this
+// works under the default `--allocator none` build. The buffer is a plain
+// struct manipulated through free functions that take a `Ring*`, which keeps
+// it usable across module boundaries (imported classes are not yet callable
+// across modules in the current compiler). Public functions are prefixed
+// `ring_` so they never collide with functions from other imported modules.
+//
+// Usage:
+//   ringbuf.Ring r = ringbuf.ring_make()
+//   ringbuf.ring_push(&r, 10)
+//   i64 v = ringbuf.ring_pop(&r)
+
+struct Ring {
+    i64[64] slots,
+    i64 head,
+    i64 count
+}
+
+// A fresh, empty ring buffer.
+fun ring_make() -> Ring {
+    return Ring{ head: 0, count: 0 }
+}
+
+// Maximum number of elements the buffer can hold.
+fun ring_capacity() -> i64 {
+    return 64
+}
+
+// Current number of buffered elements.
+fun ring_len(Ring* r) -> i64 {
+    unsafe {
+        return (~r).count
+    }
+    return 0
+}
+
+fun ring_is_empty(Ring* r) -> bool {
+    unsafe {
+        return (~r).count == 0
+    }
+    return true
+}
+
+fun ring_is_full(Ring* r) -> bool {
+    unsafe {
+        return (~r).count == 64
+    }
+    return false
+}
+
+// Append a value at the tail. Returns false when the buffer is full.
+fun ring_push(Ring* r, i64 value) -> bool {
+    unsafe {
+        if (~r).count == 64 {
+            return false
+        }
+        i64 tail = ((~r).head + (~r).count) % 64
+        i64* slots = cast<i64*>(&(~r).slots)
+        slots[tail] = value
+        (~r).count = (~r).count + 1
+        return true
+    }
+    return false
+}
+
+// Remove and return the head value. Returns 0 when empty.
+fun ring_pop(Ring* r) -> i64 {
+    unsafe {
+        if (~r).count == 0 {
+            return 0
+        }
+        i64* slots = cast<i64*>(&(~r).slots)
+        i64 value = slots[(~r).head]
+        (~r).head = ((~r).head + 1) % 64
+        (~r).count = (~r).count - 1
+        return value
+    }
+    return 0
+}
+
+// Return the head value without removing it. Returns 0 when empty.
+fun ring_peek(Ring* r) -> i64 {
+    unsafe {
+        if (~r).count == 0 {
+            return 0
+        }
+        i64* slots = cast<i64*>(&(~r).slots)
+        return slots[(~r).head]
+    }
+    return 0
+}
+
+// Value at logical offset from the head (0 = front). Returns 0 when the
+// offset is out of range.
+fun ring_at(Ring* r, i64 offset) -> i64 {
+    unsafe {
+        if offset < 0 {
+            return 0
+        }
+        if offset >= (~r).count {
+            return 0
+        }
+        i64 idx = ((~r).head + offset) % 64
+        i64* slots = cast<i64*>(&(~r).slots)
+        return slots[idx]
+    }
+    return 0
+}
+
+// Drop all buffered elements.
+fun ring_clear(Ring* r) -> void {
+    unsafe {
+        (~r).head = 0
+        (~r).count = 0
+    }
+}

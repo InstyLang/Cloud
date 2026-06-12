@@ -4,10 +4,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace CloudServer {
@@ -22,6 +25,11 @@ struct ServerConfig {
     std::string s3SecretAccessKey;
     std::string bootstrapToken;
     std::size_t maxPackageBytes = 50 * 1024 * 1024;
+
+    // Per-client (token or IP) write rate limiting for mutating endpoints
+    // (publish, yank, token create/revoke). 0 disables limiting.
+    int writeRateLimit = 30;          // requests allowed per window
+    int writeRateWindowSeconds = 60;  // sliding window length
 
     static ServerConfig fromEnvironment();
     std::optional<std::string> validateForServe() const;
@@ -108,7 +116,14 @@ public:
     bool ping();
     void runMigrations();
     std::optional<AuthIdentity> authenticate(const std::string& token);
-    CreatedToken createToken(const std::string& accountName, const std::string& scope);
+    CreatedToken createToken(const std::string& accountName, const std::string& scope,
+                             std::optional<long> expiresInSeconds = std::nullopt);
+    // Revokes the token whose hash matches `token` (the caller's own token).
+    // Returns true if a live token was revoked.
+    bool revokeToken(const std::string& token);
+    // Admin revoke by token prefix; revokes all live tokens with that prefix.
+    // Returns the number of tokens revoked.
+    int revokeTokensByPrefix(const std::string& tokenPrefix);
     std::optional<PackageVersionInfo> getVersion(
         const std::string& owner,
         const std::string& packageName,
@@ -159,6 +174,28 @@ private:
     std::unique_ptr<State> state;
 };
 
+// Thread-safe sliding-window rate limiter keyed by an arbitrary client id
+// (auth token hash or remote address). Used to throttle mutating endpoints.
+class RateLimiter {
+public:
+    RateLimiter(int maxRequests, int windowSeconds);
+
+    // Records a hit for `clientId`; returns true if the request is allowed,
+    // false if the client exceeded the configured rate. A non-positive limit
+    // disables throttling (always allowed).
+    bool allow(const std::string& clientId);
+
+private:
+    struct Bucket {
+        std::chrono::steady_clock::time_point windowStart;
+        int count = 0;
+    };
+    int maxRequests_;
+    std::chrono::seconds window_;
+    std::mutex mutex_;
+    std::unordered_map<std::string, Bucket> buckets_;
+};
+
 class RegistryService {
 public:
     RegistryService(ServerConfig config, RegistryDatabase& database, S3Storage& storage);
@@ -168,9 +205,11 @@ private:
     ServerConfig config;
     RegistryDatabase& database;
     S3Storage& storage;
+    RateLimiter writeLimiter;
 
     HttpResponse handleHealth();
     HttpResponse handleTokenCreate(const HttpRequest& request);
+    HttpResponse handleTokenRevoke(const HttpRequest& request);
     HttpResponse handlePackageRoute(const HttpRequest& request, const std::vector<std::string>& segments);
     HttpResponse handlePublish(
         const HttpRequest& request,
@@ -185,6 +224,10 @@ private:
         const std::string& version
     );
     std::optional<AuthIdentity> authenticateBearer(const HttpRequest& request, HttpResponse& failure);
+    // Returns a failure response (and false) when the client exceeded the write
+    // rate limit; the client id prefers the bearer token, falling back to the
+    // X-Forwarded-For / remote address header.
+    bool enforceWriteRate(const HttpRequest& request, HttpResponse& failure);
 };
 
 class HttpServer {

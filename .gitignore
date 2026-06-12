@@ -1,0 +1,8 @@
+build/
+.cloud/
+*.o
+*.a
+*.so
+*.dylib
+*.tar.gz
+.DS_Store

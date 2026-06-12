@@ -13,6 +13,8 @@ services:
       S3_SECRET_ACCESS_KEY: minioadmin
       CLOUD_BOOTSTRAP_TOKEN: change-me-bootstrap-token
       CLOUD_MAX_PACKAGE_BYTES: "52428800"
+      CLOUD_WRITE_RATE_LIMIT: "30"
+      CLOUD_WRITE_RATE_WINDOW_SECONDS: "60"
     depends_on:
       postgres:
         condition: service_healthy

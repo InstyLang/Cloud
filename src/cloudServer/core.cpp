@@ -385,6 +385,9 @@ bool allowedArchivePath(std::string path) {
     if (path == "config.toml") {
         return true;
     }
+    if (path == "AGENTS.md" || path == "CLAUDE.md") {
+        return true;
+    }
     if (path == "src" || startsWith(path, "src/")) {
         return true;
     }

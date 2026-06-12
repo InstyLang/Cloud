@@ -1,4 +1,5 @@
 #include <cloudServer/core.hpp>
+#include <cloudServer/service.hpp>
 
 #include <zlib.h>
 
@@ -104,7 +105,7 @@ void testPackageNames() {
 void testManifest() {
     std::string error;
     auto manifest = CloudServer::parsePackageManifest(
-        R"({"name":"@landing/http-core","version":"1.0.0","main":"src/main.ecx","dependencies":{}})",
+        R"({"name":"@landing/http-core","version":"1.0.0","main":"src/main.ins","dependencies":{}})",
         "landing",
         "http-core",
         "1.0.0",
@@ -114,7 +115,7 @@ void testManifest() {
     assert(manifest->name == "@landing/http-core");
 
     auto bad = CloudServer::parsePackageManifest(
-        R"({"name":"@other/http-core","version":"1.0.0","main":"src/main.ecx","dependencies":{}})",
+        R"({"name":"@other/http-core","version":"1.0.0","main":"src/main.ins","dependencies":{}})",
         "landing",
         "http-core",
         "1.0.0",
@@ -126,7 +127,7 @@ void testManifest() {
 void testArchiveValidation() {
     std::string archive = makeArchive({
         {"config.toml", "[project]\nname = \"demo\"\n"},
-        {"src/main.ecx", "module main\n"}
+        {"src/main.ins", "module main\n"}
     });
     auto validation = CloudServer::validateSourceArchive(archive, 1024 * 1024);
     assert(validation.ok);
@@ -164,6 +165,23 @@ void testCrypto() {
     assert(!CloudServer::constantTimeEquals("same", "nope"));
 }
 
+void testRateLimiter() {
+    // 3 requests per window allowed; the 4th is rejected. Disabled limiter
+    // (limit <= 0) always allows.
+    CloudServer::RateLimiter limiter(3, 60);
+    assert(limiter.allow("client-a"));
+    assert(limiter.allow("client-a"));
+    assert(limiter.allow("client-a"));
+    assert(!limiter.allow("client-a"));
+    // A different client has its own independent bucket.
+    assert(limiter.allow("client-b"));
+
+    CloudServer::RateLimiter disabled(0, 60);
+    for (int i = 0; i < 100; ++i) {
+        assert(disabled.allow("anyone"));
+    }
+}
+
 }
 
 int main() {
@@ -173,6 +191,7 @@ int main() {
     testArchiveValidation();
     testMultipart();
     testCrypto();
+    testRateLimiter();
     std::cout << "cloud-server tests passed\n";
     return 0;
 }

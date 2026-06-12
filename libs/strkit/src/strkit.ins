@@ -1,0 +1,152 @@
+module strkit
+
+// @ecx/strkit — string helpers for NUL-terminated `text`, complementing std::str.
+// Allocation-free: all functions read through u8 pointers without copying.
+// Public functions are prefixed `str_` so they never collide with functions
+// from other imported modules (including the shorter std::str names).
+
+// True when the byte is an ASCII digit '0'..'9'.
+fun str_is_digit(u8 c) -> bool {
+    return c >= 48 && c <= 57
+}
+
+// True when the byte is ASCII whitespace (space, tab, newline, CR, FF, VT).
+fun str_is_space(u8 c) -> bool {
+    if c == 32 {
+        return true
+    }
+    if c >= 9 && c <= 13 {
+        return true
+    }
+    return false
+}
+
+// True when the byte is an ASCII letter a..z or A..Z.
+fun str_is_alpha(u8 c) -> bool {
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    return false
+}
+
+// Lowercase an ASCII byte; non-letters pass through unchanged.
+fun str_to_lower(u8 c) -> u8 {
+    if c >= 65 && c <= 90 {
+        unsafe {
+            return cast<u8>(c + 32)
+        }
+    }
+    return c
+}
+
+// Uppercase an ASCII byte; non-letters pass through unchanged.
+fun str_to_upper(u8 c) -> u8 {
+    if c >= 97 && c <= 122 {
+        unsafe {
+            return cast<u8>(c - 32)
+        }
+    }
+    return c
+}
+
+// Length of a NUL-terminated string (excluding the terminator).
+fun str_length(text s) -> i64 {
+    unsafe {
+        u8* p = cast<u8*>(s)
+        i64 i = 0
+        while p[i] != 0 {
+            i = i + 1
+        }
+        return i
+    }
+    return 0
+}
+
+// True when s ends with the given suffix.
+fun str_ends_with(text s, text suffix) -> bool {
+    i64 ls = str_length(s)
+    i64 lf = str_length(suffix)
+    if lf > ls {
+        return false
+    }
+    unsafe {
+        u8* ps = cast<u8*>(s)
+        u8* pf = cast<u8*>(suffix)
+        i64 off = ls - lf
+        i64 i = 0
+        while i < lf {
+            if ps[off + i] != pf[i] {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// Count occurrences of byte c in s.
+fun str_count_byte(text s, u8 c) -> i64 {
+    i64 n = 0
+    unsafe {
+        u8* p = cast<u8*>(s)
+        i64 i = 0
+        while p[i] != 0 {
+            if p[i] == c {
+                n = n + 1
+            }
+            i = i + 1
+        }
+    }
+    return n
+}
+
+// Parse a base-10 integer with optional leading '-'. Stops at the first
+// non-digit. Empty or non-numeric input yields 0.
+fun str_parse_int(text s) -> i64 {
+    unsafe {
+        u8* p = cast<u8*>(s)
+        i64 i = 0
+        bool neg = false
+        if p[0] == 45 {
+            neg = true
+            i = 1
+        }
+        i64 value = 0
+        while str_is_digit(p[i]) {
+            value = value * 10 + cast<i64>(p[i] - 48)
+            i = i + 1
+        }
+        if neg {
+            return 0 - value
+        }
+        return value
+    }
+    return 0
+}
+
+// Compare strings lexicographically: -1 if a<b, 0 if equal, 1 if a>b.
+fun str_compare(text a, text b) -> i64 {
+    unsafe {
+        u8* pa = cast<u8*>(a)
+        u8* pb = cast<u8*>(b)
+        i64 i = 0
+        while true {
+            u8 ca = pa[i]
+            u8 cb = pb[i]
+            if ca != cb {
+                if ca < cb {
+                    return 0 - 1
+                }
+                return 1
+            }
+            if ca == 0 {
+                return 0
+            }
+            i = i + 1
+        }
+    }
+    return 0
+}

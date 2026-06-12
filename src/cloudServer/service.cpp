@@ -506,6 +506,14 @@ ServerConfig ServerConfig::fromEnvironment() {
     config.s3SecretAccessKey = envValue("S3_SECRET_ACCESS_KEY");
     config.bootstrapToken = envValue("CLOUD_BOOTSTRAP_TOKEN");
     config.maxPackageBytes = parseSize(envValue("CLOUD_MAX_PACKAGE_BYTES"), config.maxPackageBytes);
+    try {
+        std::string limit = envValue("CLOUD_WRITE_RATE_LIMIT");
+        if (!limit.empty()) config.writeRateLimit = std::stoi(limit);
+        std::string window = envValue("CLOUD_WRITE_RATE_WINDOW_SECONDS");
+        if (!window.empty()) config.writeRateWindowSeconds = std::stoi(window);
+    } catch (const std::exception&) {
+        // Leave defaults on malformed values.
+    }
     return config;
 }
 
@@ -594,7 +602,8 @@ WHERE t."tokenHash" = $1
     };
 }
 
-CreatedToken RegistryDatabase::createToken(const std::string& accountName, const std::string& scope) {
+CreatedToken RegistryDatabase::createToken(const std::string& accountName, const std::string& scope,
+                                           std::optional<long> expiresInSeconds) {
     std::string token = randomToken();
     std::string tokenHash = sha256Hex(token);
     std::string tokenPrefix = token.substr(0, std::min<std::size_t>(token.size(), 18));
@@ -610,10 +619,19 @@ RETURNING id::text AS id, name
 )SQL", {accountName});
 
         std::string accountId = account.value(0, "id");
-        execParams(lease.connection, R"SQL(
+        if (expiresInSeconds && *expiresInSeconds > 0) {
+            // Compute expiry server-side as now() + N seconds (avoids client
+            // clock skew and timezone formatting issues).
+            execParams(lease.connection, R"SQL(
+INSERT INTO "authTokens" ("accountId", "tokenHash", "tokenPrefix", scope, "expiresAt")
+VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5::double precision))
+)SQL", {accountId, tokenHash, tokenPrefix, scope, std::to_string(*expiresInSeconds)});
+        } else {
+            execParams(lease.connection, R"SQL(
 INSERT INTO "authTokens" ("accountId", "tokenHash", "tokenPrefix", scope)
 VALUES ($1, $2, $3, $4)
 )SQL", {accountId, tokenHash, tokenPrefix, scope});
+        }
         execSql(lease.connection, "COMMIT");
 
         return CreatedToken{
@@ -627,6 +645,35 @@ VALUES ($1, $2, $3, $4)
         execSql(lease.connection, "ROLLBACK");
         throw;
     }
+}
+
+bool RegistryDatabase::revokeToken(const std::string& token) {
+    if (token.empty()) {
+        return false;
+    }
+    auto lease = state->lease();
+    std::string tokenHash = sha256Hex(token);
+    auto result = execParams(lease.connection, R"SQL(
+UPDATE "authTokens"
+SET "revokedAt" = now()
+WHERE "tokenHash" = $1 AND "revokedAt" IS NULL
+RETURNING id::text AS id
+)SQL", {tokenHash});
+    return result.rows() > 0;
+}
+
+int RegistryDatabase::revokeTokensByPrefix(const std::string& tokenPrefix) {
+    if (tokenPrefix.empty()) {
+        return 0;
+    }
+    auto lease = state->lease();
+    auto result = execParams(lease.connection, R"SQL(
+UPDATE "authTokens"
+SET "revokedAt" = now()
+WHERE "tokenPrefix" = $1 AND "revokedAt" IS NULL
+RETURNING id::text AS id
+)SQL", {tokenPrefix});
+    return static_cast<int>(result.rows());
 }
 
 std::optional<PackageVersionInfo> RegistryDatabase::getVersion(
@@ -997,8 +1044,31 @@ std::string S3Storage::presignedGetUrl(const std::string& objectKey, int expires
     return state->endpoint.origin + canonicalPath + "?" + canonicalQueryString + "&X-Amz-Signature=" + signature;
 }
 
+RateLimiter::RateLimiter(int maxRequests, int windowSeconds)
+    : maxRequests_(maxRequests), window_(std::max(1, windowSeconds)) {}
+
+bool RateLimiter::allow(const std::string& clientId) {
+    if (maxRequests_ <= 0) {
+        return true; // limiting disabled
+    }
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> guard(mutex_);
+    Bucket& bucket = buckets_[clientId];
+    if (bucket.count == 0 || now - bucket.windowStart >= window_) {
+        bucket.windowStart = now;
+        bucket.count = 1;
+        return true;
+    }
+    if (bucket.count >= maxRequests_) {
+        return false;
+    }
+    ++bucket.count;
+    return true;
+}
+
 RegistryService::RegistryService(ServerConfig config, RegistryDatabase& database, S3Storage& storage)
-    : config(std::move(config)), database(database), storage(storage) {}
+    : config(std::move(config)), database(database), storage(storage),
+      writeLimiter(this->config.writeRateLimit, this->config.writeRateWindowSeconds) {}
 
 HttpResponse RegistryService::handle(const HttpRequest& request) {
     try {
@@ -1008,6 +1078,15 @@ HttpResponse RegistryService::handle(const HttpRequest& request) {
         }
         if (request.method == "POST" && segments.size() == 2 && segments[0] == "v1" && segments[1] == "tokens") {
             return handleTokenCreate(request);
+        }
+        // DELETE /v1/tokens revokes the caller's own token; POST .../revoke
+        // (admin) revokes by token prefix.
+        if (request.method == "DELETE" && segments.size() == 2 && segments[0] == "v1" && segments[1] == "tokens") {
+            return handleTokenRevoke(request);
+        }
+        if (request.method == "POST" && segments.size() == 3 && segments[0] == "v1" &&
+            segments[1] == "tokens" && segments[2] == "revoke") {
+            return handleTokenRevoke(request);
         }
         if (segments.size() >= 4 && segments[0] == "v1" && segments[1] == "packages") {
             return handlePackageRoute(request, segments);
@@ -1032,6 +1111,11 @@ HttpResponse RegistryService::handleTokenCreate(const HttpRequest& request) {
         return HttpResponse::error(401, "bootstrap token required");
     }
 
+    HttpResponse rateFailure;
+    if (!enforceWriteRate(request, rateFailure)) {
+        return rateFailure;
+    }
+
     JsonValue body = JsonValue::parse(request.body);
     auto accountName = body.getString("accountName");
     std::string scope = body.getString("scope").value_or("publish");
@@ -1042,13 +1126,64 @@ HttpResponse RegistryService::handleTokenCreate(const HttpRequest& request) {
         return HttpResponse::error(400, "scope must be publish or admin");
     }
 
-    CreatedToken created = database.createToken(*accountName, scope);
+    // Optional expiry: expiresInSeconds takes precedence over expiresInDays.
+    std::optional<long> expiresInSeconds;
+    if (auto seconds = body.getValue("expiresInSeconds"); seconds && seconds->isNumber()) {
+        expiresInSeconds = static_cast<long>(seconds->asInt());
+    } else if (auto days = body.getValue("expiresInDays"); days && days->isNumber()) {
+        expiresInSeconds = static_cast<long>(days->asInt()) * 24L * 60L * 60L;
+    }
+    if (expiresInSeconds && *expiresInSeconds <= 0) {
+        return HttpResponse::error(400, "expiry must be a positive duration");
+    }
+
+    CreatedToken created = database.createToken(*accountName, scope, expiresInSeconds);
     JsonValue::Object response;
     response["accountName"] = created.accountName;
     response["scope"] = created.scope;
     response["token"] = created.token;
     response["tokenPrefix"] = created.tokenPrefix;
+    if (expiresInSeconds) {
+        response["expiresInSeconds"] = static_cast<std::int64_t>(*expiresInSeconds);
+    }
     return HttpResponse::json(201, response);
+}
+
+HttpResponse RegistryService::handleTokenRevoke(const HttpRequest& request) {
+    std::string token = bearerToken(request.header("authorization"));
+    if (token.empty()) {
+        return HttpResponse::error(401, "bearer token required");
+    }
+
+    HttpResponse rateFailure;
+    if (!enforceWriteRate(request, rateFailure)) {
+        return rateFailure;
+    }
+
+    // Bootstrap/admin path: revoke by prefix from the JSON body. Otherwise a
+    // caller may revoke their own presented token.
+    JsonValue body = request.body.empty() ? JsonValue() : JsonValue::parse(request.body);
+    auto prefix = body.getString("tokenPrefix");
+    if (prefix && !prefix->empty()) {
+        bool isBootstrap = constantTimeEquals(token, config.bootstrapToken);
+        std::optional<AuthIdentity> identity = isBootstrap ? std::nullopt : database.authenticate(token);
+        bool isAdmin = identity && (identity->scope == "admin");
+        if (!isBootstrap && !isAdmin) {
+            return HttpResponse::error(403, "revoking by prefix requires the bootstrap or an admin token");
+        }
+        int revoked = database.revokeTokensByPrefix(*prefix);
+        JsonValue::Object response;
+        response["revoked"] = static_cast<std::int64_t>(revoked);
+        return HttpResponse::json(200, response);
+    }
+
+    bool revoked = database.revokeToken(token);
+    if (!revoked) {
+        return HttpResponse::error(404, "token not found or already revoked");
+    }
+    JsonValue::Object response;
+    response["revoked"] = static_cast<std::int64_t>(1);
+    return HttpResponse::json(200, response);
 }
 
 HttpResponse RegistryService::handlePackageRoute(const HttpRequest& request, const std::vector<std::string>& segments) {
@@ -1161,6 +1296,11 @@ HttpResponse RegistryService::handlePublish(
         return authFailure;
     }
 
+    HttpResponse rateFailure;
+    if (!enforceWriteRate(request, rateFailure)) {
+        return rateFailure;
+    }
+
     std::string errorMessage;
     auto parts = parseMultipartForm(request.header("content-type"), request.body, errorMessage);
     if (!parts) {
@@ -1232,6 +1372,11 @@ HttpResponse RegistryService::handleYank(
         return authFailure;
     }
 
+    HttpResponse rateFailure;
+    if (!enforceWriteRate(request, rateFailure)) {
+        return rateFailure;
+    }
+
     YankResult result = database.yankVersion(*identity, owner, packageName, version);
     if (result.status == YankStatus::Missing) {
         return HttpResponse::error(404, result.errorMessage);
@@ -1257,6 +1402,25 @@ std::optional<AuthIdentity> RegistryService::authenticateBearer(const HttpReques
         return std::nullopt;
     }
     return identity;
+}
+
+bool RegistryService::enforceWriteRate(const HttpRequest& request, HttpResponse& failure) {
+    // Prefer the bearer token as the client key (a hash, never logged raw),
+    // falling back to a forwarded client address so unauthenticated bursts are
+    // still throttled.
+    std::string token = bearerToken(request.header("authorization"));
+    std::string clientId;
+    if (!token.empty()) {
+        clientId = "tok:" + sha256Hex(token);
+    } else {
+        std::string forwarded = request.header("x-forwarded-for");
+        clientId = "ip:" + (forwarded.empty() ? std::string("unknown") : forwarded);
+    }
+    if (!writeLimiter.allow(clientId)) {
+        failure = HttpResponse::error(429, "rate limit exceeded; slow down");
+        return false;
+    }
+    return true;
 }
 
 HttpServer::HttpServer(ServerConfig config, RegistryService& service)

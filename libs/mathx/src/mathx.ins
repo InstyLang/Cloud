@@ -1,0 +1,116 @@
+module mathx
+
+// @ecx/mathx — integer math utilities that complement std::math.
+// All functions operate on i64; smaller integer types widen at the call site.
+// Public functions are prefixed `mathx_` so they never collide with functions
+// from other imported modules.
+
+// Greatest common divisor (Euclid). mathx_gcd(0, 0) == 0.
+fun mathx_gcd(i64 a, i64 b) -> i64 {
+    i64 x = a
+    i64 y = b
+    if x < 0 {
+        x = 0 - x
+    }
+    if y < 0 {
+        y = 0 - y
+    }
+    while y != 0 {
+        i64 t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+// Least common multiple. mathx_lcm(0, n) == 0.
+fun mathx_lcm(i64 a, i64 b) -> i64 {
+    if a == 0 {
+        return 0
+    }
+    if b == 0 {
+        return 0
+    }
+    i64 g = mathx_gcd(a, b)
+    i64 r = (a / g) * b
+    if r < 0 {
+        return 0 - r
+    }
+    return r
+}
+
+// n! for n >= 0; n < 0 yields 0. Overflows silently past 20! in i64.
+fun mathx_factorial(i64 n) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    i64 result = 1
+    i64 i = 2
+    while i <= n {
+        result = result * i
+        i = i + 1
+    }
+    return result
+}
+
+// True when n is prime. Negatives, 0 and 1 are not prime.
+fun mathx_is_prime(i64 n) -> bool {
+    if n < 2 {
+        return false
+    }
+    if n < 4 {
+        return true
+    }
+    if n % 2 == 0 {
+        return false
+    }
+    i64 d = 3
+    while d * d <= n {
+        if n % d == 0 {
+            return false
+        }
+        d = d + 2
+    }
+    return true
+}
+
+// Integer square root: largest r with r*r <= n. n < 0 yields 0.
+fun mathx_isqrt(i64 n) -> i64 {
+    if n < 0 {
+        return 0
+    }
+    i64 r = 0
+    while (r + 1) * (r + 1) <= n {
+        r = r + 1
+    }
+    return r
+}
+
+// Modular exponentiation: (base^exp) mod m. exp < 0 or m <= 0 yields 0.
+fun mathx_pow_mod(i64 base, i64 exp, i64 m) -> i64 {
+    if exp < 0 {
+        return 0
+    }
+    if m <= 0 {
+        return 0
+    }
+    i64 result = 1
+    i64 b = base % m
+    i64 e = exp
+    while e > 0 {
+        if e % 2 == 1 {
+            result = (result * b) % m
+        }
+        b = (b * b) % m
+        e = e / 2
+    }
+    return result
+}
+
+// True when n is a power of two (n > 0).
+fun mathx_is_pow2(i64 n) -> bool {
+    if n <= 0 {
+        return false
+    }
+    return (n & (n - 1)) == 0
+}

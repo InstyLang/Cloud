@@ -14,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <print>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -25,7 +26,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* versionText = "0.2.0";
-constexpr const char* defaultRegistryUrl = "http://localhost:8080";
+constexpr const char* defaultRegistryUrl = "https://ecliptix-web.insty.workers.dev";
 constexpr std::size_t defaultMaxPackageBytes = 50 * 1024 * 1024;
 
 struct ParsedArgs {
@@ -39,9 +40,10 @@ struct ParsedArgs {
 struct ProjectConfig {
     std::string projectName = "app";
     std::string version = "0.1.0";
-    std::string mainFile = "src/main.ecx";
+    std::string mainFile = "src/main.ins";
     std::string outputDir = ".cloud/objects";
     std::string outputFormat = "executable";
+    std::vector<std::string> moduleSearchPaths;
     std::map<std::string, std::string> dependencies;
 };
 
@@ -63,6 +65,9 @@ struct LockEntry {
     std::string owner;
     std::string packageName;
     std::string version;
+    std::string range = "*";        // requested range that resolved to version
+    std::string checksumSha256;     // sha256 of the source archive (may be empty)
+    bool direct = true;             // listed in config.toml vs pulled transitively
 };
 
 bool startsWith(std::string_view value, std::string_view prefix) {
@@ -76,7 +81,10 @@ bool isFlagWithValue(const std::string& value) {
            value == "--bootstrap-token" ||
            value == "--version" ||
            value == "--name" ||
-           value == "--scope";
+           value == "--scope" ||
+           value == "--expires-days" ||
+           value == "--expires-seconds" ||
+           value == "--prefix";
 }
 
 std::string getEnv(const char* key, const std::string& fallback = "") {
@@ -230,6 +238,23 @@ ProjectConfig loadProjectConfig(const fs::path& configPath) {
             config.outputFormat = value;
         } else if (section == "paths" && key == "output_dir") {
             config.outputDir = value;
+        } else if (section == "paths" && key == "module_search_paths") {
+            // Parse a TOML inline array: ["a", "b", ...]. Tolerant of spacing.
+            std::string list = CloudServer::trimCopy(value);
+            if (!list.empty() && list.front() == '[') {
+                list = list.substr(1);
+            }
+            if (!list.empty() && list.back() == ']') {
+                list.pop_back();
+            }
+            std::stringstream items(list);
+            std::string item;
+            while (std::getline(items, item, ',')) {
+                std::string path = stripQuotes(CloudServer::trimCopy(item));
+                if (!path.empty()) {
+                    config.moduleSearchPaths.push_back(path);
+                }
+            }
         } else if (section == "dependencies") {
             config.dependencies[key] = value;
         }
@@ -239,10 +264,10 @@ ProjectConfig loadProjectConfig(const fs::path& configPath) {
 }
 
 void printHelp() {
-    std::println("Cloud - Ecliptix Package Manager v{}\n", versionText);
+    std::println("Cloud - Insty Package Manager v{}\n", versionText);
     std::println("Usage: cloud <command> [options]\n");
     std::println("Commands:");
-    std::println("  init [name]                  Initialize a new Ecliptix project");
+    std::println("  init [name]                  Initialize a new Insty project");
     std::println("  build                        Build the current project");
     std::println("  run                          Build and run the project");
     std::println("  clean                        Clean build artifacts");
@@ -253,6 +278,7 @@ void printHelp() {
     std::println("  list                         List installed packages");
     std::println("  yank <@owner/package>        Yank a published package version");
     std::println("  token <account>              Create a publish token using bootstrap auth");
+    std::println("  token revoke                 Revoke a token (--token self, or --prefix with admin/bootstrap)");
     std::println("  test                         Run project tests");
     std::println("  version                      Show version information");
     std::println("  help                         Show this help message\n");
@@ -263,6 +289,9 @@ void printHelp() {
     std::println("  --name <@owner/package>      Publish name override");
     std::println("  --version <range|version>    Install range or publish/yank version override");
     std::println("  --scope <publish|admin>      Token scope");
+    std::println("  --expires-days <n>           Token expiry in days (token create)");
+    std::println("  --expires-seconds <n>        Token expiry in seconds (token create)");
+    std::println("  --prefix <tokenPrefix>       Token prefix to revoke (token revoke, admin/bootstrap)");
     std::println("  --config <file>              Use specific config file");
     std::println("  --verbose                    Show detailed output");
     std::println("  --release                    Build in release mode");
@@ -270,26 +299,26 @@ void printHelp() {
 
 void printVersion() {
     std::println("Cloud v{}", versionText);
-    std::println("Ecliptix Package Manager");
+    std::println("Insty Package Manager");
 }
 
 void initProject(const std::string& name) {
-    std::println("Initializing Ecliptix project: {}", name);
+    std::println("Initializing Insty project: {}", name);
 
     createDirectory(name);
     createDirectory(fs::path(name) / "src");
     createDirectory(fs::path(name) / ".cloud/libs");
     createDirectory(fs::path(name) / ".cloud/objects");
 
-    std::string configContent = R"(# Ecliptix Project Configuration
+    std::string configContent = R"(# Insty Project Configuration
 
 [project]
 name = ")" + name + R"("
 version = "0.1.0"
-description = "A new Ecliptix project"
+description = "A new Insty project"
 authors = ["Your Name"]
 license = "MIT"
-main = "src/main.ecx"
+main = "src/main.ins"
 module = "main"
 
 [compiler]
@@ -299,7 +328,7 @@ output_format = "executable"
 debug_info = true
 
 [paths]
-module_search_paths = [".", "src", ".cloud/libs"]
+module_search_paths = [".", "src"]
 output_dir = ".cloud/objects"
 
 [features]
@@ -329,7 +358,7 @@ fun main() -> i32 {
     return 0
 }
 )";
-    writeTextFile(fs::path(name) / "src/main.ecx", mainContent);
+    writeTextFile(fs::path(name) / "src/main.ins", mainContent);
 
     std::string gitignoreContent = R"(# Build artifacts
 .cloud/objects/
@@ -348,24 +377,26 @@ Thumbs.db
 )";
     writeTextFile(fs::path(name) / ".gitignore", gitignoreContent);
 
-    std::string readmeContent = "# " + name + "\n\nAn Ecliptix project.\n\n";
+    std::string readmeContent = "# " + name + "\n\nAn Insty project.\n\n";
     readmeContent += "## Building\n\n```bash\ncloud build\n```\n\n";
     readmeContent += "## Running\n\n```bash\ncloud run\n```\n";
     writeTextFile(fs::path(name) / "README.md", readmeContent);
 
     std::string agentsContent = "# AGENTS.md\n\n";
     agentsContent += "Project: " + name + "\n\n";
-    agentsContent += R"AGENTS(Agent-facing guide for working in this Ecliptix project.
+    agentsContent += R"AGENTS(Agent-facing guide for working in this Insty project.
 
 ## Project Layout
 
 - `config.toml` - Cloud project configuration.
-- `src/main.ecx` - Main ECX entry module.
+- `src/main.ins` - Main Insty entry module.
 - `.cloud/objects/` - Build outputs and object files.
-- `.cloud/libs/` - Installed package source dependencies.
-- `.cloud/modules/` - Staged dependency modules during builds.
+- `.cloud/libs/` - Installed package source dependencies (`owner/package/version`).
+- `.cloud/modules/` - Dependency modules staged in scoped layout for builds:
+  `@owner/package` is staged as `.cloud/modules/owner/package.ins` and imported
+  as `import owner::package`.
 - `README.md` - Human project overview.
-- `AGENTS.md` - Agent instructions and ECX reference.
+- `AGENTS.md` - Agent instructions and Insty reference.
 - `CLAUDE.md` - Claude-specific project guide.
 
 ## Common Commands
@@ -382,7 +413,7 @@ cloud publish --name @owner/package --version 0.1.0
 
 Useful environment variables:
 
-- `ECLIPTIX_COMPILER` - Override compiler path used by Cloud.
+- `INSTY_COMPILER` - Override compiler path used by Cloud.
 - `CLOUD_CONFIG` - Override default `config.toml` path.
 - `CLOUD_REGISTRY_URL` - Override package registry URL.
 - `CLOUD_TOKEN` - Registry bearer token.
@@ -390,11 +421,11 @@ Useful environment variables:
 ## Compiler Commands
 
 ```bash
-ecxp src/main.ecx -o app
-ecxp -c src/main.ecx --objects-dir .cloud/objects
-ecxp --emit-llvm src/main.ecx --objects-dir .cloud/objects
-ecxp --target x86_64_linux src/main.ecx -o app
-ecxp --target targets/x86_64-unknown-none.toml --freestanding src/main.ecx -o kernel.elf
+insty src/main.ins -o app
+insty -c src/main.ins --objects-dir .cloud/objects
+insty --emit-llvm src/main.ins --objects-dir .cloud/objects
+insty --target x86_64_linux src/main.ins -o app
+insty --target targets/x86_64-unknown-none.toml --freestanding src/main.ins -o kernel.elf
 ```
 
 Compiler flags currently useful for OS/dev work:
@@ -420,7 +451,7 @@ Cloud reads these sections:
 [project]
 name = "app"
 version = "0.1.0"
-main = "src/main.ecx"
+main = "src/main.ins"
 module = "main"
 
 [compiler]
@@ -428,14 +459,14 @@ optimization_level = 0
 output_format = "executable"
 
 [paths]
-module_search_paths = [".", "src", ".cloud/libs"]
+module_search_paths = [".", "src"]
 output_dir = ".cloud/objects"
 
 [dependencies]
 # "@owner/package" = "^1.0.0"
 ```
 
-## ECX Basics
+## Insty Basics
 
 ```ecx
 module main
@@ -458,8 +489,10 @@ Core syntax:
 - Pointers use `T*`, address-of uses `&x`, dereference uses `~ptr`.
 - Operators: arithmetic `+ - * /`, comparison `== != < > <= >=`, logical `&& || !`, bitwise `& | ^`, shifts `<< >>`.
 - Unary `!` negates booleans and is C-like for integers (`!n` is true when `n == 0`).
-- Control flow includes `if`, `while`, `loop`, `break`, and `return`.
-- Imports use `import module` and C headers use `cimport header` in hosted mode.
+- Control flow includes `if`, `while`, `loop`, `switch`, `break`, and `return`.
+- Imports use `import module`; `::` separates scope/directory segments, so a
+  dependency `@owner/package` is imported as `import owner::package`. C headers
+  use `cimport header` in hosted mode.
 
 Primitive types:
 
@@ -536,7 +569,7 @@ import uefi
 
 fun main(u8* image_handle, u8* system_table) -> i64 {
     uefi.init(image_handle, system_table)
-    uefi.println("hello from ECX")
+    uefi.println("hello from Insty")
     return 0
 }
 ```
@@ -546,7 +579,7 @@ fun main(u8* image_handle, u8* system_table) -> i64 {
 Use freestanding mode for kernels, boot code, UEFI apps, and custom OS targets:
 
 ```bash
-ecxp --freestanding --target targets/x86_64-unknown-none.toml src/main.ecx -o kernel.elf
+insty --freestanding --target targets/x86_64-unknown-none.toml src/main.ins -o kernel.elf
 ```
 
 Freestanding guarantees:
@@ -563,10 +596,10 @@ External allocator ABI when using `--allocator external`:
 
 ```ecx
 // Provided by linked runtime/kernel objects.
-// __ecx_alloc(u64 size, u64 align) -> i8*
-// __ecx_free(i8* ptr, u64 size, u64 align) -> void
+// __ins_alloc(u64 size, u64 align) -> i8*
+// __ins_free(i8* ptr, u64 size, u64 align) -> void
 // Optional compatibility hook for @realloc:
-// __ecx_realloc(i8* ptr, u64 size, u64 align) -> i8*
+// __ins_realloc(i8* ptr, u64 size, u64 align) -> i8*
 ```
 
 Allocator mode defaults to `none`. Any heap-backed feature is a compile-time error until the build explicitly passes `--allocator runtime` or `--allocator external`.
@@ -663,7 +696,7 @@ struct [repr(C), packed(on), align(16)] Descriptor {
 
 Supported struct directives:
 
-- `repr(C)` - Preserved in AST; ECX already keeps declared field order.
+- `repr(C)` - Preserved in AST; Insty already keeps declared field order.
 - `packed(on)` - Emits packed LLVM struct layout.
 - `align(N)` - Applies alignment to stack allocations of the struct.
 
@@ -679,7 +712,7 @@ section ".boot" {
 
 ## Unsafe Boundary
 
-ECX requires explicit `unsafe { ... }` blocks for operations that can break memory, ABI, or platform safety.
+Insty requires explicit `unsafe { ... }` blocks for operations that can break memory, ABI, or platform safety.
 
 ```ecx
 fun [unsafe(on), mangle(off)] outb(u16 port, u8 value) -> void {
@@ -838,7 +871,7 @@ registers (`{dx}`) are supported. Template placeholders are `$0`, `$1`, ...
 ## Agent Workflow
 
 - Prefer small, targeted changes.
-- Run `cloud build` or direct `ecxp` commands after modifying ECX code.
+- Run `cloud build` or direct `insty` commands after modifying Insty code.
 - Use `--emit-llvm` to inspect ABI, section, volatile, atomic, and target behavior.
 - Do not assume hosted APIs in freestanding projects.
 - Keep unsafe operations inside explicit `unsafe { ... }` blocks.
@@ -850,7 +883,7 @@ registers (`{dx}`) are supported. Template placeholders are `$0`, `$1`, ...
 
     std::string claudeContent = "# CLAUDE.md\n\n";
     claudeContent += "Project: " + name + "\n\n";
-    claudeContent += R"CLAUDE(Claude-specific instructions for this Ecliptix project.
+    claudeContent += R"CLAUDE(Claude-specific instructions for this Insty project.
 
 Read `AGENTS.md` first. It is the canonical project and language reference generated by `cloud init`.
 
@@ -858,7 +891,7 @@ Read `AGENTS.md` first. It is the canonical project and language reference gener
 
 - Use `cloud build` for normal verification.
 - Use `cloud run` only when the program is expected to be a hosted executable.
-- Use `ecxp --emit-llvm ...` when checking low-level ABI, target, section, volatile, atomic, or inline assembly behavior.
+- Use `insty --emit-llvm ...` when checking low-level ABI, target, section, volatile, atomic, or inline assembly behavior.
 - Do not add libc, syscalls, heap allocation, `cimport`, or runtime startup to freestanding/kernel code unless explicitly requested.
 
 ## Useful Commands
@@ -867,11 +900,11 @@ Read `AGENTS.md` first. It is the canonical project and language reference gener
 cloud build
 cloud run
 cloud clean
-ecxp --emit-llvm src/main.ecx --objects-dir .cloud/objects
-ecxp --freestanding --target targets/x86_64-unknown-none.toml src/main.ecx -o kernel.elf
+insty --emit-llvm src/main.ins --objects-dir .cloud/objects
+insty --freestanding --target targets/x86_64-unknown-none.toml src/main.ins -o kernel.elf
 ```
 
-## Low-Level ECX Quick Reference
+## Low-Level Insty Quick Reference
 
 ```ecx
 section ".boot" {
@@ -918,7 +951,7 @@ fun indirect(u64 fn_addr) -> i64 {
 ## Allocator Boundary
 
 - Allocator mode defaults to `none`; heap-backed features are compile errors unless the build passes `--allocator runtime` or `--allocator external`.
-- External allocators must provide `__ecx_alloc(u64 size, u64 align) -> i8*` and `__ecx_free(i8* ptr, u64 size, u64 align) -> void`.
+- External allocators must provide `__ins_alloc(u64 size, u64 align) -> i8*` and `__ins_free(i8* ptr, u64 size, u64 align) -> void`.
 - `@malloc`, `@free`, `new`, `delete`, and heap-backed array/string helpers lower through that ABI.
 
 ## Notes
@@ -939,28 +972,33 @@ fun indirect(u64 fn_addr) -> i64 {
 }
 
 std::string compilerPath() {
-    std::string configured = getEnv("ECLIPTIX_COMPILER");
+    std::string configured = getEnv("INSTY_COMPILER");
     if (!configured.empty()) {
         return configured;
     }
-    if (fs::exists("./ecxp")) {
-        return fs::absolute("./ecxp").string();
+    if (fs::exists("./insty")) {
+        return fs::absolute("./insty").string();
     }
-    if (fs::exists("build/ecxp")) {
-        return fs::absolute("build/ecxp").string();
+    if (fs::exists("build/insty")) {
+        return fs::absolute("build/insty").string();
     }
-    if (fs::exists("Compiler/build/ecxp")) {
-        return fs::absolute("Compiler/build/ecxp").string();
+    if (fs::exists("Compiler/build/insty")) {
+        return fs::absolute("Compiler/build/insty").string();
     }
-    if (fs::exists("../Compiler/build/ecxp")) {
-        return fs::absolute("../Compiler/build/ecxp").string();
+    if (fs::exists("../Compiler/build/insty")) {
+        return fs::absolute("../Compiler/build/insty").string();
     }
-    if (fs::exists("../../Compiler/build/ecxp")) {
-        return fs::absolute("../../Compiler/build/ecxp").string();
+    if (fs::exists("../../Compiler/build/insty")) {
+        return fs::absolute("../../Compiler/build/insty").string();
     }
-    return "ecxp";
+    return "insty";
 }
 
+// Lockfile format v2 (whitespace-separated, one entry per line):
+//   @owner/package <version> <range> <checksumSha256> <direct|transitive>
+// A leading "# cloud-lock v2" comment marks the format. Legacy v1 lines
+// (`@owner/package <version>`) are still accepted for backward compatibility:
+// missing fields default to range "*", empty checksum, and direct=true.
 std::vector<LockEntry> readLockFile() {
     std::vector<LockEntry> entries;
     std::ifstream file(".cloud/packages.lock");
@@ -968,45 +1006,69 @@ std::vector<LockEntry> readLockFile() {
         return entries;
     }
 
-    std::string scopedName;
-    std::string version;
-    while (file >> scopedName >> version) {
-        std::size_t slash = scopedName.find('/');
-        if (!CloudServer::isValidScopedPackageName(scopedName) || slash == std::string::npos) {
+    std::string line;
+    while (std::getline(file, line)) {
+        std::string trimmed = CloudServer::trimCopy(line);
+        if (trimmed.empty() || trimmed.front() == '#') {
             continue;
         }
-        entries.push_back({
-            scopedName,
-            scopedName.substr(1, slash - 1),
-            scopedName.substr(slash + 1),
-            version
-        });
+        std::stringstream parts(trimmed);
+        std::string scopedName, version, range, checksum, origin;
+        parts >> scopedName >> version;
+        parts >> range >> checksum >> origin; // optional (v2)
+
+        std::size_t slash = scopedName.find('/');
+        if (!CloudServer::isValidScopedPackageName(scopedName) ||
+            slash == std::string::npos || version.empty()) {
+            continue;
+        }
+
+        LockEntry entry;
+        entry.scopedName = scopedName;
+        entry.owner = scopedName.substr(1, slash - 1);
+        entry.packageName = scopedName.substr(slash + 1);
+        entry.version = version;
+        entry.range = range.empty() ? "*" : range;
+        entry.checksumSha256 = (checksum == "-") ? "" : checksum;
+        entry.direct = (origin != "transitive");
+        entries.push_back(entry);
     }
     return entries;
 }
 
-void writeLockFile(const std::vector<LockEntry>& entries) {
+void writeLockFile(std::vector<LockEntry> entries) {
     createDirectory(".cloud");
     std::ofstream file(".cloud/packages.lock", std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("could not write .cloud/packages.lock");
     }
+    // Deterministic ordering so the lockfile is stable across runs.
+    std::sort(entries.begin(), entries.end(), [](const LockEntry& a, const LockEntry& b) {
+        return a.scopedName < b.scopedName;
+    });
+    file << "# cloud-lock v2\n";
     for (const auto& entry : entries) {
-        file << entry.scopedName << " " << entry.version << "\n";
+        file << entry.scopedName << " " << entry.version << " "
+             << (entry.range.empty() ? "*" : entry.range) << " "
+             << (entry.checksumSha256.empty() ? "-" : entry.checksumSha256) << " "
+             << (entry.direct ? "direct" : "transitive") << "\n";
     }
 }
 
-void upsertLockEntry(const PackageSpec& spec, const std::string& version) {
+void upsertLockEntry(const LockEntry& newEntry) {
     std::vector<LockEntry> entries = readLockFile();
     bool updated = false;
     for (auto& entry : entries) {
-        if (entry.scopedName == spec.scopedName) {
-            entry.version = version;
+        if (entry.scopedName == newEntry.scopedName) {
+            // Preserve direct=true if it was ever requested directly.
+            bool direct = entry.direct || newEntry.direct;
+            entry = newEntry;
+            entry.direct = direct;
             updated = true;
         }
     }
     if (!updated) {
-        entries.push_back({spec.scopedName, spec.owner, spec.packageName, version});
+        entries.push_back(newEntry);
     }
     writeLockFile(entries);
 }
@@ -1036,17 +1098,44 @@ void syncInstalledModules(bool verbose = false) {
     fs::remove_all(moduleDir);
     createDirectory(moduleDir);
 
+    // Stage each installed package into a scoped layout so the compiler's
+    // `::` module resolver finds them: `import owner::packageName` resolves to
+    // `<moduleDir>/owner/packageName.ins`, and submodules resolve to
+    // `<moduleDir>/owner/packageName/<sub>.ins` (-> owner::packageName::sub).
+    //
+    // Mapping of a package's `src/` tree:
+    //   src/<packageName>.ins  -> owner/<packageName>.ins        (package entry)
+    //   src/main.ins           -> owner/<packageName>.ins        (entry fallback)
+    //   src/<other>.ins        -> owner/<packageName>/<other>.ins (submodule)
     for (const auto& entry : readLockFile()) {
         fs::path sourceRoot = fs::path(".cloud/libs") / entry.owner / entry.packageName / entry.version / "src";
         if (!fs::exists(sourceRoot)) {
             continue;
         }
+
+        const fs::path ownerDir = moduleDir / entry.owner;
+        const fs::path packageEntry = ownerDir / (entry.packageName + ".ins");
+        const fs::path packageSubdir = ownerDir / entry.packageName;
+        bool hasNamedEntry = fs::exists(sourceRoot / (entry.packageName + ".ins"));
+
         for (const auto& file : fs::recursive_directory_iterator(sourceRoot)) {
-            if (!file.is_regular_file()) {
+            if (!file.is_regular_file() || file.path().extension() != ".ins") {
                 continue;
             }
             fs::path relative = fs::relative(file.path(), sourceRoot);
-            fs::path target = moduleDir / relative;
+            fs::path target;
+
+            const bool isNamedEntry = (relative == fs::path(entry.packageName + ".ins"));
+            const bool isMainEntry = (relative == fs::path("main.ins"));
+
+            if (isNamedEntry || (isMainEntry && !hasNamedEntry)) {
+                // Package entry module -> owner/packageName.ins (owner::packageName)
+                target = packageEntry;
+            } else {
+                // Submodule -> owner/packageName/<relative> (owner::packageName::...)
+                target = packageSubdir / relative;
+            }
+
             createDirectory(target.parent_path());
             fs::copy_file(file.path(), target, fs::copy_options::overwrite_existing);
             if (verbose) {
@@ -1071,12 +1160,26 @@ void buildProject(const ParsedArgs& args) {
     fs::path executablePath = outputDir / config.projectName;
     fs::path moduleDir = fs::absolute(".cloud/modules");
 
-    std::string command = "cd " + shellQuote(moduleDir) + " && " + shellQuote(compilerPath());
+    // Build from the project root and hand the compiler explicit module search
+    // paths via `-L`, so scoped dependency imports (`import owner::package`)
+    // resolve against `.cloud/modules/owner/package.ins`. This replaces the
+    // older `cd .cloud/modules` hack, which only worked for flat modules.
+    std::string command = shellQuote(compilerPath());
     if (!args.release) {
         command += " -O0";
     }
     command += " " + shellQuote(mainPath);
     command += " --objects-dir " + shellQuote(outputDir);
+
+    // Staged dependency modules first, then any user-configured search paths.
+    command += " -L " + shellQuote(moduleDir);
+    for (const auto& searchPath : config.moduleSearchPaths) {
+        if (searchPath.empty()) {
+            continue;
+        }
+        command += " -L " + shellQuote(fs::absolute(searchPath));
+    }
+
     if (config.outputFormat == "executable") {
         command += " -o " + shellQuote(executablePath);
     } else {
@@ -1139,7 +1242,7 @@ void testProject(const ParsedArgs& args) {
     int passed = 0;
     int failed = 0;
     for (const auto& entry : fs::directory_iterator(testDir)) {
-        if (entry.path().extension() != ".ecx") {
+        if (entry.path().extension() != ".ins") {
             continue;
         }
         std::print("  Testing: {} ... ", entry.path().string());
@@ -1254,6 +1357,41 @@ HttpResult httpPostJson(const std::string& url, const std::string& body, const s
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCurlBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
+
+    CURLcode code = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
+    curl_slist_free_all(headerList);
+    curl_easy_cleanup(curl);
+
+    if (code != CURLE_OK) {
+        throw std::runtime_error(curl_easy_strerror(code));
+    }
+    return result;
+}
+
+HttpResult httpDelete(const std::string& url, const std::string& body,
+                      const std::vector<std::string>& headers) {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        throw std::runtime_error("failed to initialize curl");
+    }
+
+    HttpResult result;
+    curl_slist* headerList = nullptr;
+    headerList = curl_slist_append(headerList, "Content-Type: application/json");
+    for (const auto& header : headers) {
+        headerList = curl_slist_append(headerList, header.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    if (!body.empty()) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+    }
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCurlBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
@@ -1697,7 +1835,16 @@ void publishPackage(const ParsedArgs& args) {
     std::println("Published {}@{}", scopedName, publishVersion);
 }
 
-std::string resolvedVersion(const ParsedArgs& args, const PackageSpec& spec) {
+// Outcome of resolving a single package spec against the registry: the chosen
+// version, its source-archive checksum, and the package's own (transitive)
+// dependency requirements parsed from its published manifest.
+struct ResolvedPackage {
+    std::string version;
+    std::string checksumSha256;
+    std::vector<PackageSpec> dependencies;
+};
+
+ResolvedPackage resolvePackage(const ParsedArgs& args, const PackageSpec& spec) {
     std::string url = registryUrl(args) + "/v1/packages/" +
         CloudServer::urlEncode(spec.owner) + "/" +
         CloudServer::urlEncode(spec.packageName) +
@@ -1710,11 +1857,37 @@ std::string resolvedVersion(const ParsedArgs& args, const PackageSpec& spec) {
     if (!version) {
         throw std::runtime_error("registry resolve response did not include a version");
     }
-    return *version;
+
+    ResolvedPackage resolved;
+    resolved.version = *version;
+    if (auto checksum = json.getString("checksumSha256")) {
+        resolved.checksumSha256 = *checksum;
+    }
+
+    // Parse transitive dependencies from the manifest's "dependencies" object,
+    // shaped as { "@owner/package": "range", ... }.
+    if (auto manifest = json.getValue("manifest"); manifest && manifest->isObject()) {
+        if (auto deps = manifest->getValue("dependencies"); deps && deps->isObject()) {
+            for (const auto& [name, range] : deps->asObject()) {
+                if (!range.isString()) {
+                    continue;
+                }
+                try {
+                    resolved.dependencies.push_back(parsePackageSpec(name, range.asString()));
+                } catch (const std::exception&) {
+                    // Skip malformed dependency entries rather than aborting the
+                    // whole resolution; surfaced later if the build needs them.
+                }
+            }
+        }
+    }
+    return resolved;
 }
 
-void installPackage(const ParsedArgs& args, const PackageSpec& spec, bool updateConfig) {
-    std::string version = resolvedVersion(args, spec);
+// Downloads a specific package version's source archive, verifies its checksum
+// (when known), and extracts it into the per-version libs directory.
+void downloadAndInstall(const ParsedArgs& args, const PackageSpec& spec,
+                        const std::string& version, const std::string& expectedChecksum) {
     std::string url = registryUrl(args) + "/v1/packages/" +
         CloudServer::urlEncode(spec.owner) + "/" +
         CloudServer::urlEncode(spec.packageName) + "/versions/" +
@@ -1722,15 +1895,90 @@ void installPackage(const ParsedArgs& args, const PackageSpec& spec, bool update
     HttpResult result = httpGet(url);
     ensureHttpSuccess(result, "download");
 
+    if (!expectedChecksum.empty()) {
+        std::string actual = CloudServer::sha256Hex(result.body);
+        if (!CloudServer::constantTimeEquals(actual, expectedChecksum)) {
+            throw std::runtime_error(
+                "checksum mismatch for " + spec.scopedName + "@" + version +
+                " (expected " + expectedChecksum + ", got " + actual + ")");
+        }
+    }
+
     fs::path installDir = fs::path(".cloud/libs") / spec.owner / spec.packageName / version;
     extractArchive(result.body, installDir);
-    upsertLockEntry(spec, version);
+}
+
+// Resolves the full transitive dependency graph rooted at `roots`, installs
+// every package, and records the result in the lockfile. Conflict policy
+// (milestone): when a package is reached via multiple ranges, the highest
+// resolved SemVer wins. Returns the resolved entries keyed by scoped name.
+std::map<std::string, LockEntry> resolveAndInstallGraph(
+    const ParsedArgs& args,
+    const std::vector<PackageSpec>& roots,
+    const std::set<std::string>& directNames
+) {
+    std::map<std::string, LockEntry> resolved; // scopedName -> chosen entry
+    std::vector<PackageSpec> worklist = roots;
+
+    while (!worklist.empty()) {
+        PackageSpec spec = worklist.back();
+        worklist.pop_back();
+
+        ResolvedPackage info = resolvePackage(args, spec);
+
+        auto existing = resolved.find(spec.scopedName);
+        if (existing != resolved.end()) {
+            // Already chosen; keep the higher version. If the new resolution is
+            // not greater, skip re-installing and re-walking its deps.
+            auto chosen = CloudServer::SemVer::parse(existing->second.version);
+            auto candidate = CloudServer::SemVer::parse(info.version);
+            if (!candidate || (chosen && chosen->compare(*candidate) >= 0)) {
+                continue;
+            }
+        }
+
+        LockEntry entry;
+        entry.scopedName = spec.scopedName;
+        entry.owner = spec.owner;
+        entry.packageName = spec.packageName;
+        entry.version = info.version;
+        entry.range = spec.range;
+        entry.checksumSha256 = info.checksumSha256;
+        entry.direct = directNames.count(spec.scopedName) > 0;
+        resolved[spec.scopedName] = entry;
+
+        downloadAndInstall(args, spec, info.version, info.checksumSha256);
+
+        // Enqueue transitive dependencies.
+        for (const auto& dep : info.dependencies) {
+            worklist.push_back(dep);
+        }
+    }
+
+    return resolved;
+}
+
+void installPackage(const ParsedArgs& args, const PackageSpec& spec, bool updateConfig) {
+    std::set<std::string> directNames{spec.scopedName};
+    auto resolved = resolveAndInstallGraph(args, {spec}, directNames);
+
+    // Merge into the existing lockfile (preserve unrelated entries).
+    for (const auto& [name, entry] : resolved) {
+        upsertLockEntry(entry);
+    }
     syncInstalledModules(args.verbose);
+
     if (updateConfig) {
         updateDependencyInConfig(configFilePath(args), spec.scopedName, spec.range);
     }
 
-    std::println("Installed {}@{} -> {}", spec.scopedName, version, installDir.string());
+    const LockEntry& root = resolved.at(spec.scopedName);
+    fs::path installDir = fs::path(".cloud/libs") / spec.owner / spec.packageName / root.version;
+    std::println("Installed {}@{} -> {}", spec.scopedName, root.version, installDir.string());
+    std::size_t transitive = resolved.size() - 1;
+    if (transitive > 0) {
+        std::println("  (+{} transitive {})", transitive, transitive == 1 ? "dependency" : "dependencies");
+    }
 }
 
 void installCommand(const ParsedArgs& args) {
@@ -1748,10 +1996,30 @@ void updateCommand(const ParsedArgs& args) {
         std::println("No dependencies configured.");
         return;
     }
+
+    // Resolve the entire graph from the direct dependencies in one pass so
+    // shared transitive deps are deduplicated and the lockfile is coherent.
+    std::vector<PackageSpec> roots;
+    std::set<std::string> directNames;
     for (const auto& [name, range] : config.dependencies) {
         PackageSpec spec = parsePackageSpec(name, range);
-        installPackage(args, spec, false);
+        roots.push_back(spec);
+        directNames.insert(spec.scopedName);
     }
+
+    auto resolved = resolveAndInstallGraph(args, roots, directNames);
+
+    // Rewrite the lockfile to exactly the resolved graph (drops stale entries).
+    std::vector<LockEntry> entries;
+    entries.reserve(resolved.size());
+    for (const auto& [name, entry] : resolved) {
+        entries.push_back(entry);
+    }
+    writeLockFile(entries);
+    syncInstalledModules(args.verbose);
+
+    std::println("Resolved {} package{} ({} direct).",
+                 resolved.size(), resolved.size() == 1 ? "" : "s", directNames.size());
 }
 
 void uninstallCommand(const ParsedArgs& args) {
@@ -1773,7 +2041,9 @@ void listCommand() {
         return;
     }
     for (const auto& entry : entries) {
-        std::println("{} {}", entry.scopedName, entry.version);
+        std::println("{} {} ({}{})", entry.scopedName, entry.version,
+                     entry.direct ? "direct" : "transitive",
+                     entry.range == "*" || entry.range.empty() ? "" : ", " + entry.range);
     }
 }
 
@@ -1807,7 +2077,43 @@ void yankCommand(const ParsedArgs& args) {
     std::println("Yanked {}@{}", spec.scopedName, version);
 }
 
+void tokenRevoke(const ParsedArgs& args) {
+    // Revoke the caller's own token, or (with --prefix) revoke by prefix using
+    // an admin/bootstrap token.
+    std::string token = tokenValue(args);
+    std::string bootstrap = optionValue(args, "--bootstrap-token", getEnv("CLOUD_BOOTSTRAP_TOKEN"));
+    std::string prefix = optionValue(args, "--prefix");
+
+    std::string authToken = !token.empty() ? token : bootstrap;
+    if (authToken.empty()) {
+        throw std::runtime_error("token revoke requires --token/CLOUD_TOKEN, or --bootstrap-token with --prefix");
+    }
+
+    std::string body;
+    if (!prefix.empty()) {
+        CloudServer::JsonValue::Object obj;
+        obj["tokenPrefix"] = prefix;
+        body = CloudServer::JsonValue(obj).serialize();
+    }
+
+    HttpResult result = httpDelete(
+        registryUrl(args) + "/v1/tokens",
+        body,
+        {"Authorization: Bearer " + authToken}
+    );
+    ensureHttpSuccess(result, "token revoke");
+
+    CloudServer::JsonValue json = CloudServer::JsonValue::parse(result.body);
+    std::println("Revoked {} token(s).", json.getValue("revoked").value_or(CloudServer::JsonValue(0)).asInt());
+}
+
 void tokenCommand(const ParsedArgs& args) {
+    // `token revoke ...` is a subcommand; otherwise create a token.
+    if (!args.positional.empty() && args.positional[0] == "revoke") {
+        tokenRevoke(args);
+        return;
+    }
+
     if (args.positional.empty()) {
         throw std::runtime_error("token requires an account name");
     }
@@ -1821,6 +2127,15 @@ void tokenCommand(const ParsedArgs& args) {
     CloudServer::JsonValue::Object body;
     body["accountName"] = accountName;
     body["scope"] = scope;
+
+    // Optional expiry: --expires-seconds takes precedence over --expires-days.
+    std::string expiresSeconds = optionValue(args, "--expires-seconds");
+    std::string expiresDays = optionValue(args, "--expires-days");
+    if (!expiresSeconds.empty()) {
+        body["expiresInSeconds"] = static_cast<std::int64_t>(std::stoll(expiresSeconds));
+    } else if (!expiresDays.empty()) {
+        body["expiresInDays"] = static_cast<std::int64_t>(std::stoll(expiresDays));
+    }
 
     HttpResult result = httpPostJson(
         registryUrl(args) + "/v1/tokens",
@@ -1849,7 +2164,7 @@ int main(int argc, char** argv) {
         }
 
         if (args.command == "init") {
-            initProject(args.positional.empty() ? "my-ecliptix-project" : args.positional[0]);
+            initProject(args.positional.empty() ? "my-insty-project" : args.positional[0]);
         } else if (args.command == "build") {
             buildProject(args);
         } else if (args.command == "run") {

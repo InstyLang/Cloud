@@ -1,0 +1,81 @@
+module vec2
+
+// @ecx/vec2 — integer 2D vector math. Vectors are plain structs; all
+// operations are free functions returning new values (no mutation, no heap).
+// Public functions are prefixed `vec2_` so they never collide with functions
+// from other imported modules.
+
+struct Vec2 {
+    i64 x,
+    i64 y
+}
+
+// Construct a vector.
+fun vec2_make(i64 x, i64 y) -> Vec2 {
+    return Vec2{ x: x, y: y }
+}
+
+// Component-wise sum.
+fun vec2_add(Vec2 a, Vec2 b) -> Vec2 {
+    return Vec2{ x: a.x + b.x, y: a.y + b.y }
+}
+
+// Component-wise difference (a - b).
+fun vec2_sub(Vec2 a, Vec2 b) -> Vec2 {
+    return Vec2{ x: a.x - b.x, y: a.y - b.y }
+}
+
+// Scalar multiply.
+fun vec2_scale(Vec2 v, i64 k) -> Vec2 {
+    return Vec2{ x: v.x * k, y: v.y * k }
+}
+
+// Negate both components.
+fun vec2_negate(Vec2 v) -> Vec2 {
+    return Vec2{ x: 0 - v.x, y: 0 - v.y }
+}
+
+// Dot product.
+fun vec2_dot(Vec2 a, Vec2 b) -> i64 {
+    return a.x * b.x + a.y * b.y
+}
+
+// Squared length (avoids floating-point sqrt).
+fun vec2_length_sq(Vec2 v) -> i64 {
+    return v.x * v.x + v.y * v.y
+}
+
+// Z component of the cross product (scalar for 2D).
+fun vec2_cross(Vec2 a, Vec2 b) -> i64 {
+    return a.x * b.y - a.y * b.x
+}
+
+// Squared Euclidean distance between two points.
+fun vec2_dist_sq(Vec2 a, Vec2 b) -> i64 {
+    i64 dx = a.x - b.x
+    i64 dy = a.y - b.y
+    return dx * dx + dy * dy
+}
+
+// Manhattan (L1) distance between two points.
+fun vec2_manhattan(Vec2 a, Vec2 b) -> i64 {
+    i64 dx = a.x - b.x
+    i64 dy = a.y - b.y
+    if dx < 0 {
+        dx = 0 - dx
+    }
+    if dy < 0 {
+        dy = 0 - dy
+    }
+    return dx + dy
+}
+
+// True when both components are equal.
+fun vec2_equals(Vec2 a, Vec2 b) -> bool {
+    return a.x == b.x && a.y == b.y
+}
+
+// Perpendicular vector (90 degree left rotation): (x, y) -> (-y, x).
+fun vec2_perp(Vec2 v) -> Vec2 {
+    return Vec2{ x: 0 - v.y, y: v.x }
+}

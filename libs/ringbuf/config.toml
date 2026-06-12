@@ -1,0 +1,37 @@
+# Insty Project Configuration
+
+[project]
+name = "@ecx/ringbuf"
+version = "0.1.0"
+description = "Fixed-capacity circular buffer of i64 (push/pop/peek/at), no heap"
+authors = ["ecx"]
+license = "MIT"
+main = "src/ringbuf.ins"
+module = "ringbuf"
+
+[compiler]
+optimization_level = 0
+ast_optimization = true
+output_format = "executable"
+debug_info = true
+
+[paths]
+module_search_paths = [".", "src"]
+output_dir = ".cloud/objects"
+
+[features]
+enable_imports = true
+enable_nested_functions = true
+enable_builtins = true
+enable_syscalls = true
+enable_pointers = true
+enable_structs = true
+enable_enums = true
+
+[diagnostics]
+error_verbosity = "normal"
+show_error_context = true
+colored_output = true
+
+[dependencies]
+# "@owner/package" = "^1.0.0"
