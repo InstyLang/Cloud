@@ -1,0 +1,19 @@
+# Woodpecker CI pipeline for the Insty Cloud package manager + registry server.
+
+steps:
+  - name: configure
+    image: insty-ci:llvm22
+    commands:
+      - cmake -S . -B build -G Ninja
+        -DCMAKE_C_COMPILER=clang
+        -DCMAKE_CXX_COMPILER=clang++
+
+  - name: build
+    image: insty-ci:llvm22
+    commands:
+      - ninja -C build
+
+  - name: test
+    image: insty-ci:llvm22
+    commands:
+      - 'if [ -f build/CTestTestfile.cmake ]; then ctest --test-dir build --output-on-failure; else echo "no ctest targets defined; skipping"; fi'
