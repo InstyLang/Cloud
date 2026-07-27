@@ -1726,6 +1726,42 @@ std::size_t writeCurlBody(char* data, std::size_t size, std::size_t count, void*
     return size * count;
 }
 
+// A statically linked OpenSSL hard-codes the CA locations of the machine it was
+// built on (Alpine defaults to /etc/ssl/cert.pem, which does not exist on
+// Debian/Ubuntu), so a release binary otherwise fails every HTTPS request with
+// "Problem with the SSL CA cert". Resolve a bundle at runtime instead; when
+// nothing is found, leave curl's own default in place.
+const char* resolveCaBundle() {
+    static const std::string cached = []() -> std::string {
+        std::error_code ec;
+        for (const char* variable : {"SSL_CERT_FILE", "CURL_CA_BUNDLE"}) {
+            std::string value = getEnv(variable);
+            if (!value.empty() && fs::exists(value, ec)) {
+                return value;
+            }
+        }
+        for (const char* candidate : {
+                 "/etc/ssl/certs/ca-certificates.crt",  // Debian, Ubuntu, Alpine
+                 "/etc/pki/tls/certs/ca-bundle.crt",    // RHEL, Fedora
+                 "/etc/ssl/ca-bundle.pem",              // openSUSE
+                 "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                 "/etc/ssl/cert.pem",                   // Alpine, macOS, BSD
+             }) {
+            if (fs::exists(candidate, ec)) {
+                return candidate;
+            }
+        }
+        return {};
+    }();
+    return cached.empty() ? nullptr : cached.c_str();
+}
+
+void applyTlsOptions(CURL* curl) {
+    if (const char* bundle = resolveCaBundle()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, bundle);
+    }
+}
+
 HttpResult httpGet(const std::string& url, const std::vector<std::string>& headers = {}) {
     CURL* curl = curl_easy_init();
     if (!curl) {
@@ -1742,6 +1778,7 @@ HttpResult httpGet(const std::string& url, const std::vector<std::string>& heade
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCurlBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
+    applyTlsOptions(curl);
     if (headerList) {
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
     }
@@ -1782,6 +1819,7 @@ HttpResult httpPostJson(const std::string& url, const std::string& body, const s
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCurlBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
+    applyTlsOptions(curl);
 
     CURLcode code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
@@ -1817,6 +1855,7 @@ HttpResult httpDelete(const std::string& url, const std::string& body,
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCurlBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
+    applyTlsOptions(curl);
 
     CURLcode code = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
@@ -1860,6 +1899,7 @@ HttpResult httpPostMultipart(
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+    applyTlsOptions(curl);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCurlBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
 

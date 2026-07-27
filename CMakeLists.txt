@@ -15,6 +15,13 @@ enable_testing()
 # Postgres/libevent. Enable with -DINSTY_BUILD_SERVER=ON.
 option(INSTY_BUILD_SERVER "Build the cloud-server registry (needs libpq + libevent)" OFF)
 
+# Fully static `cloud` for release artifacts: a binary built against a distro's
+# glibc carries that glibc's version floor (and libcurl/openssl sonames), so it
+# fails to start on older systems. Linking statically -- on Alpine/musl, with
+# the *-static dev packages installed -- produces a single dependency-free
+# executable that runs on any x86-64 Linux. Enable with -DINSTY_STATIC=ON.
+option(INSTY_STATIC "Link the cloud CLI statically (release artifacts)" OFF)
+
 # Debug-friendly flags only on compilers that understand them (GCC/Clang).
 if(NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ggdb -O0")
@@ -60,15 +67,29 @@ else()
         include/cloudServer/core.hpp
     )
     target_include_directories(InstyCloudCore PUBLIC include)
-    target_link_libraries(InstyCloudCore
-        PUBLIC
-            PkgConfig::OPENSSL
-            PkgConfig::ZLIB
-    )
+    if(INSTY_STATIC)
+        # The imported PkgConfig:: targets always point at the shared objects,
+        # so a static link needs pkg-config's --static link lines instead
+        # (these also pull in the transitive deps: brotli, nghttp2, zstd, ...).
+        target_include_directories(InstyCloudCore PUBLIC ${OPENSSL_INCLUDE_DIRS} ${ZLIB_INCLUDE_DIRS})
+        target_link_libraries(InstyCloudCore PUBLIC ${OPENSSL_STATIC_LDFLAGS} ${ZLIB_STATIC_LDFLAGS})
+    else()
+        target_link_libraries(InstyCloudCore
+            PUBLIC
+                PkgConfig::OPENSSL
+                PkgConfig::ZLIB
+        )
+    endif()
 
     # Package manager / registry client CLI
     add_executable(cloud src/cloud.cpp)
-    target_link_libraries(cloud PRIVATE InstyCloudCore PkgConfig::LIBCURL)
+    if(INSTY_STATIC)
+        target_include_directories(cloud PRIVATE ${LIBCURL_INCLUDE_DIRS})
+        target_link_libraries(cloud PRIVATE InstyCloudCore ${LIBCURL_STATIC_LDFLAGS})
+        target_link_options(cloud PRIVATE -static)
+    else()
+        target_link_libraries(cloud PRIVATE InstyCloudCore PkgConfig::LIBCURL)
+    endif()
 
     # Package registry server (Unix only). Opt-in via -DINSTY_BUILD_SERVER=ON
     # because it pulls in libpq + libevent.
