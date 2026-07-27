@@ -3,11 +3,21 @@
 #include <curl/curl.h>
 #include <zlib.h>
 
+// `cloud upgrade` needs the path of the running executable to find the
+// toolchain install directory (the real binaries live next to each other in
+// <prefix>/libexec; <prefix>/bin only holds symlinks).
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -35,6 +45,7 @@ struct ParsedArgs {
     std::map<std::string, std::string> values;
     bool verbose = false;
     bool release = false;
+    bool yes = false;  // -y / --yes: accept defaults, skip interactive prompts
 };
 
 struct ProjectConfig {
@@ -43,6 +54,21 @@ struct ProjectConfig {
     std::string mainFile = "src/main.ins";
     std::string outputDir = ".cloud/objects";
     std::string outputFormat = "executable";
+    // Target triple/name and linker default to the host platform so a plain
+    // `cloud build` produces a native binary. The Insty compiler itself
+    // Target defaults to the host platform so a plain `cloud build` produces a
+    // native binary. The Insty compiler itself defaults to x86_64_linux, so on
+    // other hosts cloud passes an explicit --target. The linker is left to the
+    // compiler, which selects the right one per target (ld.lld / lld-link /
+    // ld64.lld); only set `linker` to override it.
+#if defined(_WIN32)
+    std::string target = "x86_64_windows";
+#elif defined(__APPLE__)
+    std::string target = "x86_64_mac";
+#else
+    std::string target = "x86_64_linux";
+#endif
+    std::string linker;
     std::vector<std::string> moduleSearchPaths;
     std::map<std::string, std::string> dependencies;
 };
@@ -84,7 +110,11 @@ bool isFlagWithValue(const std::string& value) {
            value == "--scope" ||
            value == "--expires-days" ||
            value == "--expires-seconds" ||
-           value == "--prefix";
+           value == "--prefix" ||
+           value == "--kind" ||
+           value == "--target" ||
+           value == "--install-dir" ||
+           value == "--linker";
 }
 
 std::string getEnv(const char* key, const std::string& fallback = "") {
@@ -158,6 +188,21 @@ std::string normalizeRegistryUrl(std::string registryUrl) {
 
 std::string shellQuote(const fs::path& path) {
     std::string value = path.string();
+#if defined(_WIN32)
+    // std::system runs the command through cmd.exe, which uses double quotes
+    // (single quotes are literal characters on Windows). Wrap in double quotes
+    // and escape any embedded double quotes by doubling them.
+    std::string output = "\"";
+    for (char ch : value) {
+        if (ch == '"') {
+            output += "\"\"";
+        } else {
+            output.push_back(ch);
+        }
+    }
+    output += "\"";
+    return output;
+#else
     std::string output = "'";
     for (char ch : value) {
         if (ch == '\'') {
@@ -168,6 +213,23 @@ std::string shellQuote(const fs::path& path) {
     }
     output += "'";
     return output;
+#endif
+}
+
+// Run a command line through the platform shell (std::system). On Windows,
+// std::system invokes `cmd.exe /c <string>`, and cmd applies a peculiar
+// quote-stripping rule: when the command contains multiple double-quoted
+// tokens (e.g. a quoted program path *and* quoted arguments), the entire
+// string must be wrapped in one extra pair of double quotes, otherwise cmd
+// mangles it and reports "The system cannot find the path specified."
+// We add that outer wrap here so callers can build a normal quoted command.
+int runSystemCommand(const std::string& command) {
+#if defined(_WIN32)
+    std::string wrapped = "\"" + command + "\"";
+    return std::system(wrapped.c_str());
+#else
+    return std::system(command.c_str());
+#endif
 }
 
 ParsedArgs parseArgs(int argc, char** argv) {
@@ -181,6 +243,8 @@ ParsedArgs parseArgs(int argc, char** argv) {
             args.verbose = true;
         } else if (value == "--release") {
             args.release = true;
+        } else if (value == "-y" || value == "--yes") {
+            args.yes = true;
         } else if (isFlagWithValue(value)) {
             if (index + 1 >= argc) {
                 throw std::runtime_error("missing value for " + value);
@@ -196,6 +260,11 @@ ParsedArgs parseArgs(int argc, char** argv) {
 std::string optionValue(const ParsedArgs& args, const std::string& key, const std::string& fallback = "") {
     auto found = args.values.find(key);
     return found == args.values.end() ? fallback : found->second;
+}
+
+// Bare (valueless) flags are collected as positionals by parseArgs.
+bool hasFlag(const ParsedArgs& args, std::string_view flag) {
+    return std::find(args.positional.begin(), args.positional.end(), flag) != args.positional.end();
 }
 
 std::string configFilePath(const ParsedArgs& args) {
@@ -236,6 +305,10 @@ ProjectConfig loadProjectConfig(const fs::path& configPath) {
             config.mainFile = value;
         } else if (section == "compiler" && key == "output_format") {
             config.outputFormat = value;
+        } else if (section == "compiler" && key == "target") {
+            config.target = value;
+        } else if (section == "compiler" && key == "linker") {
+            config.linker = value;
         } else if (section == "paths" && key == "output_dir") {
             config.outputDir = value;
         } else if (section == "paths" && key == "module_search_paths") {
@@ -267,7 +340,7 @@ void printHelp() {
     std::println("Cloud - Insty Package Manager v{}\n", versionText);
     std::println("Usage: cloud <command> [options]\n");
     std::println("Commands:");
-    std::println("  init [name]                  Initialize a new Insty project");
+    std::println("  init [name]                  Create a new Insty project (interactive wizard)");
     std::println("  build                        Build the current project");
     std::println("  run                          Build and run the project");
     std::println("  clean                        Clean build artifacts");
@@ -275,6 +348,7 @@ void printHelp() {
     std::println("  install <@owner/package>     Download and install a package");
     std::println("  uninstall <@owner/package>   Remove an installed package");
     std::println("  update                       Install dependencies from config.toml");
+    std::println("  upgrade                      Update the Insty toolchain (insty, cloud, insty-lsp)");
     std::println("  list                         List installed packages");
     std::println("  yank <@owner/package>        Yank a published package version");
     std::println("  token <account>              Create a publish token using bootstrap auth");
@@ -293,6 +367,13 @@ void printHelp() {
     std::println("  --expires-seconds <n>        Token expiry in seconds (token create)");
     std::println("  --prefix <tokenPrefix>       Token prefix to revoke (token revoke, admin/bootstrap)");
     std::println("  --config <file>              Use specific config file");
+    std::println("  --check                      upgrade: report available updates only");
+    std::println("  --force                      upgrade: reinstall even if up to date");
+    std::println("  --install-dir <dir>          upgrade: toolchain dir, default INSTY_PREFIX/libexec");
+    std::println("  -y, --yes                    init: accept defaults, skip the wizard");
+    std::println("  --kind <kind>                init: executable|library|freestanding|uefi");
+    std::println("  --target <name|.toml>        init/build: target (default: host)");
+    std::println("  --linker <path>              init/build: linker executable override");
     std::println("  --verbose                    Show detailed output");
     std::println("  --release                    Build in release mode");
 }
@@ -302,14 +383,271 @@ void printVersion() {
     std::println("Insty Package Manager");
 }
 
-void initProject(const std::string& name) {
-    std::println("Initializing Insty project: {}", name);
+// ---------------------------------------------------------------------------
+// Project scaffolding (`cloud init`)
+// ---------------------------------------------------------------------------
+
+enum class ProjectKind {
+    Executable,   // hosted console program (default)
+    Library,      // reusable package, no main; built with -c
+    Freestanding, // kernel / bare-metal, --freestanding + custom target
+    Uefi,         // UEFI application (x86_64_efi)
+};
+
+struct InitOptions {
+    std::string name = "my-insty-project";
+    ProjectKind kind = ProjectKind::Executable;
+    // Empty target means "host default" (cloud fills the host target at build
+    // time). A non-empty value is written into config.toml verbatim.
+    std::string target;
+    std::string linker;
+    std::string outputFormat = "executable";
+};
+
+std::string projectKindName(ProjectKind kind) {
+    switch (kind) {
+        case ProjectKind::Executable:   return "executable";
+        case ProjectKind::Library:      return "library";
+        case ProjectKind::Freestanding: return "freestanding";
+        case ProjectKind::Uefi:         return "uefi";
+    }
+    return "executable";
+}
+
+std::optional<ProjectKind> parseProjectKind(const std::string& value) {
+    if (value == "executable" || value == "exe" || value == "app" || value == "bin") {
+        return ProjectKind::Executable;
+    }
+    if (value == "library" || value == "lib" || value == "package" || value == "pkg") {
+        return ProjectKind::Library;
+    }
+    if (value == "freestanding" || value == "kernel" || value == "bare" || value == "os") {
+        return ProjectKind::Freestanding;
+    }
+    if (value == "uefi" || value == "efi") {
+        return ProjectKind::Uefi;
+    }
+    return std::nullopt;
+}
+
+// Read a line from stdin, returning `fallback` on empty input or EOF.
+std::string promptLine(const std::string& question, const std::string& fallback) {
+    if (fallback.empty()) {
+        std::print("{}: ", question);
+    } else {
+        std::print("{} [{}]: ", question, fallback);
+    }
+    std::string line;
+    if (!std::getline(std::cin, line)) {
+        return fallback;
+    }
+    line = CloudServer::trimCopy(line);
+    return line.empty() ? fallback : line;
+}
+
+// Present a numbered menu and return the chosen 1-based option's value, or the
+// default (matching `defaultValue`) on empty input.
+std::string promptChoice(const std::string& title,
+                         const std::vector<std::pair<std::string, std::string>>& options,
+                         const std::string& defaultValue) {
+    std::println("{}", title);
+    int defaultIndex = 1;
+    for (std::size_t i = 0; i < options.size(); ++i) {
+        const bool isDefault = options[i].first == defaultValue;
+        if (isDefault) {
+            defaultIndex = static_cast<int>(i) + 1;
+        }
+        std::println("  {}) {}{}", i + 1, options[i].second,
+                     isDefault ? "  (default)" : "");
+    }
+    while (true) {
+        std::print("Choose [1-{}, default {}]: ", options.size(), defaultIndex);
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            return defaultValue;
+        }
+        line = CloudServer::trimCopy(line);
+        if (line.empty()) {
+            return defaultValue;
+        }
+        // Accept either a number or the value/name directly.
+        for (const auto& option : options) {
+            if (line == option.first) {
+                return option.first;
+            }
+        }
+        try {
+            std::size_t consumed = 0;
+            int index = std::stoi(line, &consumed);
+            if (consumed == line.size() && index >= 1 &&
+                index <= static_cast<int>(options.size())) {
+                return options[static_cast<std::size_t>(index - 1)].first;
+            }
+        } catch (const std::exception&) {
+            // fall through to re-prompt
+        }
+        std::println("  Please enter a number between 1 and {}.", options.size());
+    }
+}
+
+// Interactive wizard that fills InitOptions from stdin. Called when `cloud init`
+// runs without -y/--yes.
+InitOptions runInitWizard(InitOptions defaults) {
+    InitOptions opts = defaults;
+    std::println("Creating a new Insty project. Press Enter to accept defaults.\n");
+
+    opts.name = promptLine("Project name", defaults.name);
+
+    std::string kind = promptChoice(
+        "\nWhat kind of project?",
+        {
+            {"executable", "Executable      - hosted console program"},
+            {"library", "Library         - reusable package (no main)"},
+            {"freestanding", "Freestanding    - kernel / bare-metal"},
+            {"uefi", "UEFI app        - firmware application"},
+        },
+        projectKindName(defaults.kind));
+    opts.kind = parseProjectKind(kind).value_or(ProjectKind::Executable);
+
+    // Target selection depends on the kind.
+    if (opts.kind == ProjectKind::Uefi) {
+        opts.target = "x86_64_efi";
+        opts.outputFormat = "uefi";
+    } else if (opts.kind == ProjectKind::Freestanding) {
+        opts.target = promptLine(
+            "\nFreestanding target spec (.toml or built-in target name)",
+            "targets/x86_64-unknown-none.toml");
+        opts.outputFormat = "executable";
+    } else {
+        std::string target = promptChoice(
+            "\nBuild target?",
+            {
+                {"", "Host           - native platform (recommended)"},
+                {"x86_64_linux", "Linux          - x86_64 ELF"},
+                {"x86_64_windows", "Windows        - x86_64 PE"},
+                {"x86_64_mac", "macOS          - x86_64 Mach-O"},
+                {"x86_64_instantos", "InstantOS      - dynamic PIE"},
+            },
+            "");
+        opts.target = target;
+        opts.outputFormat = (opts.kind == ProjectKind::Library) ? "object" : "executable";
+    }
+
+    std::println("");
+    return opts;
+}
+
+// Build the config.toml [compiler] body lines for a set of init options.
+std::string compilerConfigSection(const InitOptions& opts) {
+    std::string section = R"([compiler]
+optimization_level = 0
+ast_optimization = true
+output_format = ")" + opts.outputFormat + R"("
+debug_info = true
+)";
+    if (opts.kind == ProjectKind::Freestanding && opts.target != "x86_64_instantos") {
+        section += "freestanding = true\n";
+    }
+    // Build target and linker default to the host platform when unset. Emit an
+    // explicit key when the wizard/flags chose a specific target, otherwise
+    // leave commented hints.
+    if (!opts.target.empty()) {
+        section += "target = \"" + opts.target + "\"\n";
+    } else {
+        section += "# Build target and linker default to the host platform. Override to\n";
+        section += "# cross-compile, e.g. target = \"x86_64_linux\" or target = \"x86_64_instantos\".\n";
+        section += "# target = \"x86_64_windows\"\n";
+    }
+    if (!opts.linker.empty()) {
+        section += "linker = \"" + opts.linker + "\"\n";
+    }
+    return section;
+}
+
+// The starter src/main.ins for a project kind.
+std::string mainTemplateFor(const InitOptions& opts) {
+    switch (opts.kind) {
+        case ProjectKind::Library:
+            // A library exposes exported functions and has no main.
+            return "module " + opts.name + R"(
+
+// Library entry module. Export functions for consumers to import.
+export fun greet() -> i32 {
+    return 42
+}
+)";
+        case ProjectKind::Uefi:
+            return R"(module main
+
+import std::uefi
+
+fun main(u8* image_handle, u8* system_table) -> i64 {
+    uefi.init(image_handle, system_table)
+    uefi.println("Hello from )" + opts.name + R"( (UEFI)!")
+    return 0
+}
+)";
+        case ProjectKind::Freestanding:
+            if (opts.target == "x86_64_instantos") {
+                return R"(module main
+
+import instantos::io
+
+fun main() -> i32 {
+    instantos.println("Hello from )" + opts.name + R"( (InstantOS)!")
+    return 0
+}
+)";
+            }
+            // Bare-metal kernel entry. No std, no syscalls.
+            return R"(module main
+
+// Freestanding kernel entry. Built with --freestanding against a custom
+// target spec; provides its own entry symbol (see the target's `entry` key).
+fun [name(kernel_main), mangle(off)] main() -> void {
+    unsafe {
+        asm("nop")
+    }
+    return
+}
+)";
+        case ProjectKind::Executable:
+        default:
+            // An InstantOS executable talks to the kernel through its own
+            // syscall stdlib rather than std::io (which assumes Linux syscalls).
+            if (opts.target == "x86_64_instantos") {
+                return R"(module main
+
+import instantos::io
+
+fun main() -> i32 {
+    instantos.println("Hello from )" + opts.name + R"(!")
+    return 0
+}
+)";
+            }
+            return R"(module main
+
+import std::io
+
+fun main() -> i32 {
+    io.println("Hello from )" + opts.name + R"(!")
+    return 0
+}
+)";
+    }
+}
+
+void initProject(const InitOptions& opts) {
+    const std::string& name = opts.name;
+    std::println("Initializing Insty {} project: {}", projectKindName(opts.kind), name);
 
     createDirectory(name);
     createDirectory(fs::path(name) / "src");
     createDirectory(fs::path(name) / ".cloud/libs");
     createDirectory(fs::path(name) / ".cloud/objects");
 
+    const std::string moduleName = (opts.kind == ProjectKind::Library) ? name : "main";
     std::string configContent = R"(# Insty Project Configuration
 
 [project]
@@ -319,14 +657,9 @@ description = "A new Insty project"
 authors = ["Your Name"]
 license = "MIT"
 main = "src/main.ins"
-module = "main"
+module = ")" + moduleName + R"("
 
-[compiler]
-optimization_level = 0
-ast_optimization = true
-output_format = "executable"
-debug_info = true
-
+)" + compilerConfigSection(opts) + R"(
 [paths]
 module_search_paths = [".", "src"]
 output_dir = ".cloud/objects"
@@ -351,13 +684,7 @@ colored_output = true
 
     writeTextFile(fs::path(name) / "config.toml", configContent);
 
-    std::string mainContent = R"(module main
-
-fun main() -> i32 {
-    console::out("Hello from )" + name + R"(!")
-    return 0
-}
-)";
+    std::string mainContent = mainTemplateFor(opts);
     writeTextFile(fs::path(name) / "src/main.ins", mainContent);
 
     std::string gitignoreContent = R"(# Build artifacts
@@ -409,7 +736,12 @@ cloud test
 cloud install @owner/package
 cloud update
 cloud publish --name @owner/package --version 0.1.0
+cloud upgrade
 ```
+
+`cloud update` installs this project's dependencies; `cloud upgrade` updates
+the toolchain itself (`insty`, `cloud`, `insty-lsp` and the standard library).
+Use `cloud upgrade --check` to only report what is available.
 
 Useful environment variables:
 
@@ -417,6 +749,7 @@ Useful environment variables:
 - `CLOUD_CONFIG` - Override default `config.toml` path.
 - `CLOUD_REGISTRY_URL` - Override package registry URL.
 - `CLOUD_TOKEN` - Registry bearer token.
+- `CLOUD_NO_UPDATE_CHECK` - Disable the daily toolchain update check.
 
 ## Compiler Commands
 
@@ -968,7 +1301,63 @@ fun indirect(u64 fn_addr) -> i64 {
     std::println("Next steps:");
     std::println("  cd {}", name);
     std::println("  cloud build");
-    std::println("  cloud run");
+    if (opts.kind == ProjectKind::Executable) {
+        std::println("  cloud run");
+    }
+}
+
+// `cloud init [name]` entry point. With -y/--yes (or when explicit --kind/
+// --target flags are given) it scaffolds non-interactively using defaults;
+// otherwise it runs an interactive wizard. Flags always override wizard/default
+// values: --kind, --target, --linker.
+void initCommand(const ParsedArgs& args) {
+    InitOptions defaults;
+    if (!args.positional.empty()) {
+        defaults.name = args.positional[0];
+    }
+
+    // Pre-seed from explicit flags (these also imply non-interactive intent).
+    bool sawKindFlag = false;
+    std::string kindFlag = optionValue(args, "--kind");
+    if (!kindFlag.empty()) {
+        auto parsed = parseProjectKind(kindFlag);
+        if (!parsed) {
+            throw std::runtime_error(
+                "unknown --kind '" + kindFlag +
+                "' (expected executable, library, freestanding, or uefi)");
+        }
+        defaults.kind = *parsed;
+        sawKindFlag = true;
+    }
+    std::string targetFlag = optionValue(args, "--target");
+    bool sawTargetFlag = args.values.find("--target") != args.values.end();
+    std::string linkerFlag = optionValue(args, "--linker");
+
+    // Default output format / target follow the chosen kind.
+    auto applyKindDefaults = [](InitOptions& o) {
+        if (o.kind == ProjectKind::Uefi) {
+            if (o.target.empty()) o.target = "x86_64_efi";
+            o.outputFormat = "uefi";
+        } else if (o.kind == ProjectKind::Library) {
+            o.outputFormat = "object";
+        } else {
+            o.outputFormat = "executable";
+        }
+    };
+
+    InitOptions opts;
+    if (args.yes || sawKindFlag || sawTargetFlag) {
+        // Non-interactive: defaults + flag overrides.
+        opts = defaults;
+        applyKindDefaults(opts);
+        if (sawTargetFlag) opts.target = targetFlag;
+        if (!linkerFlag.empty()) opts.linker = linkerFlag;
+    } else {
+        opts = runInitWizard(defaults);
+        if (!linkerFlag.empty()) opts.linker = linkerFlag;
+    }
+
+    initProject(opts);
 }
 
 std::string compilerPath() {
@@ -976,20 +1365,25 @@ std::string compilerPath() {
     if (!configured.empty()) {
         return configured;
     }
-    if (fs::exists("./insty")) {
-        return fs::absolute("./insty").string();
-    }
-    if (fs::exists("build/insty")) {
-        return fs::absolute("build/insty").string();
-    }
-    if (fs::exists("Compiler/build/insty")) {
-        return fs::absolute("Compiler/build/insty").string();
-    }
-    if (fs::exists("../Compiler/build/insty")) {
-        return fs::absolute("../Compiler/build/insty").string();
-    }
-    if (fs::exists("../../Compiler/build/insty")) {
-        return fs::absolute("../../Compiler/build/insty").string();
+    // Candidate locations relative to a project/workspace, trying both the bare
+    // name and the Windows .exe suffix so a native build is found.
+    static const char* kBases[] = {
+        "./insty",
+        "build/insty",
+        "Compiler/build/insty",
+        "../Compiler/build/insty",
+        "../../Compiler/build/insty",
+    };
+    for (const char* base : kBases) {
+#if defined(_WIN32)
+        fs::path withExe = fs::path(std::string(base) + ".exe");
+        if (fs::exists(withExe)) {
+            return fs::absolute(withExe).string();
+        }
+#endif
+        if (fs::exists(base)) {
+            return fs::absolute(base).string();
+        }
     }
     return "insty";
 }
@@ -1147,6 +1541,13 @@ void syncInstalledModules(bool verbose = false) {
 
 void buildProject(const ParsedArgs& args) {
     ProjectConfig config = loadProjectConfig(configFilePath(args));
+    // Command-line --target/--linker override config.toml for this build.
+    if (args.values.find("--target") != args.values.end()) {
+        config.target = optionValue(args, "--target");
+    }
+    if (args.values.find("--linker") != args.values.end()) {
+        config.linker = optionValue(args, "--linker");
+    }
     fs::path mainPath = fs::absolute(config.mainFile);
     fs::path outputDir = fs::absolute(config.outputDir);
 
@@ -1158,6 +1559,9 @@ void buildProject(const ParsedArgs& args) {
     syncInstalledModules(args.verbose);
 
     fs::path executablePath = outputDir / config.projectName;
+#if defined(_WIN32)
+    executablePath += ".exe";
+#endif
     fs::path moduleDir = fs::absolute(".cloud/modules");
 
     // Build from the project root and hand the compiler explicit module search
@@ -1167,6 +1571,12 @@ void buildProject(const ParsedArgs& args) {
     std::string command = shellQuote(compilerPath());
     if (!args.release) {
         command += " -O0";
+    }
+    if (!config.target.empty()) {
+        command += " --target " + config.target;
+    }
+    if (!config.linker.empty()) {
+        command += " --linker " + config.linker;
     }
     command += " " + shellQuote(mainPath);
     command += " --objects-dir " + shellQuote(outputDir);
@@ -1190,7 +1600,7 @@ void buildProject(const ParsedArgs& args) {
         std::println("Running: {}", command);
     }
 
-    int result = std::system(command.c_str());
+    int result = runSystemCommand(command);
     if (result != 0) {
         throw std::runtime_error("build failed with exit code: " + std::to_string(result));
     }
@@ -1206,6 +1616,9 @@ void buildProject(const ParsedArgs& args) {
 void runProject(const ParsedArgs& args) {
     ProjectConfig config = loadProjectConfig(configFilePath(args));
     fs::path executablePath = fs::path(config.outputDir) / config.projectName;
+#if defined(_WIN32)
+    executablePath += ".exe";
+#endif
     if (!fs::exists(executablePath)) {
         throw std::runtime_error("Executable not found. Run 'cloud build' first.");
     }
@@ -1214,7 +1627,7 @@ void runProject(const ParsedArgs& args) {
     if (args.verbose) {
         std::println("Executing: {}", command);
     }
-    int result = std::system(command.c_str());
+    int result = runSystemCommand(command);
     if (result != 0) {
         std::println(stderr, "Program exited with code: {}", result);
     }
@@ -1239,6 +1652,10 @@ void testProject(const ParsedArgs& args) {
         throw std::runtime_error("Test directory not found: " + testDir);
     }
 
+    ProjectConfig config = loadProjectConfig(configFilePath(args));
+    fs::path objectsDir = fs::absolute(config.outputDir);
+    createDirectory(objectsDir);
+
     int passed = 0;
     int failed = 0;
     for (const auto& entry : fs::directory_iterator(testDir)) {
@@ -1246,8 +1663,13 @@ void testProject(const ParsedArgs& args) {
             continue;
         }
         std::print("  Testing: {} ... ", entry.path().string());
-        std::string command = shellQuote(compilerPath()) + " " + shellQuote(entry.path()) + " -o .cloud/objects/test.o";
-        int result = std::system(command.c_str());
+        std::string command = shellQuote(compilerPath());
+        if (!config.target.empty()) {
+            command += " --target " + config.target;
+        }
+        command += " " + shellQuote(entry.path()) + " -c --objects-dir " +
+                   shellQuote(objectsDir);
+        int result = runSystemCommand(command);
         if (result == 0) {
             std::println("PASS");
             ++passed;
@@ -2152,6 +2574,515 @@ void tokenCommand(const ParsedArgs& args) {
     std::println("{}", *token);
 }
 
+// ---------------------------------------------------------------------------
+// Toolchain upgrade (`cloud upgrade`)
+//
+// install.sh lays the toolchain out as:
+//     <prefix>/libexec/{insty, libs/, cloud, insty-lsp}   <- real files
+//     <prefix>/bin/{insty, cloud, insty-lsp}              -> symlinks
+// so updating in place means replacing the real files in libexec: the symlinks
+// keep working, and the compiler still finds its stdlib as <insty dir>/libs
+// (it resolves through the symlink to the real binary).
+//
+// Binaries come from each component's GitHub release. The stdlib is not a
+// release asset, so it is taken from the Compiler source tarball at the same
+// tag and swapped in next to `insty`.
+// ---------------------------------------------------------------------------
+
+constexpr const char* compilerRepo = "InstyLang/Compiler";
+constexpr const char* lspRepo = "InstyLang/LSP";
+constexpr const char* cloudRepo = "InstyLang/Cloud";
+constexpr std::size_t maxSourceArchiveBytes = 256u * 1024u * 1024u;
+constexpr std::time_t updateCheckIntervalSeconds = 24 * 60 * 60;
+
+struct ToolchainComponent {
+    std::string name;   // logical name; also the installed file stem
+    std::string repo;   // GitHub owner/repo publishing the release
+    std::string asset;  // release asset for this platform ("" = none published)
+};
+
+// Release assets are currently published for Linux x86-64 (and Windows for the
+// compiler + LSP). Where no asset exists, upgrade reports it instead of
+// silently skipping, so the user knows to build from source via install.sh.
+std::vector<ToolchainComponent> toolchainComponents() {
+#if defined(_WIN32)
+    return {
+        {"insty", compilerRepo, "insty-windows-x86_64.exe"},
+        {"insty-lsp", lspRepo, "insty-lsp-windows-x86_64.exe"},
+        {"cloud", cloudRepo, ""},
+    };
+#elif defined(__APPLE__)
+    return {
+        {"insty", compilerRepo, ""},
+        {"insty-lsp", lspRepo, ""},
+        {"cloud", cloudRepo, ""},
+    };
+#else
+    return {
+        {"insty", compilerRepo, "insty"},
+        {"insty-lsp", lspRepo, "insty-lsp"},
+        {"cloud", cloudRepo, "cloud"},
+    };
+#endif
+}
+
+std::string executableFileName(const std::string& name) {
+#if defined(_WIN32)
+    return name + ".exe";
+#else
+    return name;
+#endif
+}
+
+std::vector<std::string> updateHttpHeaders() {
+    return {std::string("User-Agent: cloud/") + versionText};
+}
+
+fs::path selfExecutablePath() {
+#if defined(_WIN32)
+    std::wstring buffer(4096, L'\0');
+    DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size()) {
+        throw std::runtime_error("could not determine the running executable path");
+    }
+    buffer.resize(length);
+    return fs::path(buffer);
+#elif defined(__APPLE__)
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buffer(size + 1, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        throw std::runtime_error("could not determine the running executable path");
+    }
+    buffer.resize(std::strlen(buffer.c_str()));
+    std::error_code ec;
+    fs::path resolved = fs::canonical(fs::path(buffer), ec);
+    return ec ? fs::path(buffer) : resolved;
+#else
+    std::error_code ec;
+    fs::path resolved = fs::canonical("/proc/self/exe", ec);
+    if (ec) {
+        throw std::runtime_error("could not resolve /proc/self/exe: " + ec.message());
+    }
+    return resolved;
+#endif
+}
+
+// Where the real toolchain files live. `--install-dir` wins, then INSTY_PREFIX
+// (matching install.sh), then the directory of the running `cloud` binary with
+// symlinks resolved -- which is exactly <prefix>/libexec for a normal install.
+fs::path resolveInstallDir(const ParsedArgs& args) {
+    std::string explicitDir = optionValue(args, "--install-dir");
+    if (!explicitDir.empty()) {
+        return fs::path(explicitDir);
+    }
+    std::string prefix = getEnv("INSTY_PREFIX");
+    if (!prefix.empty()) {
+        fs::path libexec = fs::path(prefix) / "libexec";
+        if (fs::exists(libexec)) {
+            return libexec;
+        }
+        return fs::path(prefix);
+    }
+    return selfExecutablePath().parent_path();
+}
+
+fs::path toolchainManifestPath(const fs::path& installDir) {
+    return installDir / "toolchain.txt";
+}
+
+// "<component> <tag>" per line. Absent for source installs (install.sh), in
+// which case upgrade treats every component as unknown and reinstalls.
+std::map<std::string, std::string> readToolchainManifest(const fs::path& installDir) {
+    std::map<std::string, std::string> versions;
+    std::ifstream file(toolchainManifestPath(installDir));
+    if (!file.is_open()) {
+        return versions;
+    }
+    std::string name;
+    std::string tag;
+    while (file >> name >> tag) {
+        versions[name] = tag;
+    }
+    return versions;
+}
+
+void writeToolchainManifest(const fs::path& installDir,
+                            const std::map<std::string, std::string>& versions) {
+    fs::path path = toolchainManifestPath(installDir);
+    std::ofstream file(path, std::ios::trunc);
+    if (!file.is_open()) {
+        throw std::runtime_error("could not write " + path.string());
+    }
+    for (const auto& [name, tag] : versions) {
+        file << name << " " << tag << "\n";
+    }
+}
+
+// GitHub redirects /releases/latest to /releases/tag/<tag>, so the effective
+// URL yields the tag without spending an API call (the REST API is rate-limited
+// to 60 requests/hour for unauthenticated clients).
+std::string latestReleaseTag(const std::string& repo) {
+    HttpResult result = httpGet("https://github.com/" + repo + "/releases/latest",
+                                updateHttpHeaders());
+    if (result.status < 200 || result.status >= 400) {
+        throw std::runtime_error("could not query the latest release of " + repo +
+                                 " (HTTP " + std::to_string(result.status) + ")");
+    }
+    constexpr std::string_view marker = "/releases/tag/";
+    std::size_t position = result.finalUrl.rfind(marker);
+    if (position == std::string::npos) {
+        throw std::runtime_error(repo + " has no published releases yet");
+    }
+    std::string tag = result.finalUrl.substr(position + marker.size());
+    std::size_t cut = tag.find_first_of("?#");
+    if (cut != std::string::npos) {
+        tag = tag.substr(0, cut);
+    }
+    if (tag.empty()) {
+        throw std::runtime_error("could not parse the latest release tag for " + repo);
+    }
+    return tag;
+}
+
+std::string downloadReleaseAsset(const std::string& repo, const std::string& tag,
+                                 const std::string& asset) {
+    std::string url = "https://github.com/" + repo + "/releases/download/" +
+                      CloudServer::urlEncode(tag) + "/" + CloudServer::urlEncode(asset);
+    HttpResult result = httpGet(url, updateHttpHeaders());
+    if (result.status != 200) {
+        throw std::runtime_error("could not download " + asset + " " + tag + " from " + repo +
+                                 " (HTTP " + std::to_string(result.status) + ")");
+    }
+    if (result.body.empty()) {
+        throw std::runtime_error("downloaded an empty file for " + asset);
+    }
+    return result.body;
+}
+
+void makeExecutable(const fs::path& path) {
+    std::error_code ec;
+    fs::permissions(path,
+                    fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                        fs::perms::others_read | fs::perms::others_exec,
+                    fs::perm_options::replace, ec);
+}
+
+// Writes next to the target and renames into place, so a failed download never
+// leaves a half-written binary. Replacing the *running* executable works on
+// POSIX (rename swaps the directory entry; the running image keeps its inode).
+// Windows refuses to rename over a running image, so the old file is moved
+// aside first and removed on a later run.
+void installFileAtomic(const fs::path& destination, const std::string& bytes) {
+    createDirectory(destination.parent_path());
+    fs::path staged = destination.parent_path() / (destination.filename().string() + ".new");
+
+    {
+        std::ofstream file(staged, std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) {
+            throw std::runtime_error("could not write " + staged.string());
+        }
+        file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!file) {
+            throw std::runtime_error("could not write " + staged.string());
+        }
+    }
+    makeExecutable(staged);
+
+    std::error_code ec;
+    fs::rename(staged, destination, ec);
+    if (!ec) {
+        return;
+    }
+
+    fs::path retired = destination.parent_path() / (destination.filename().string() + ".old");
+    std::error_code ignored;
+    fs::remove(retired, ignored);
+    fs::rename(destination, retired, ec);
+    if (ec) {
+        fs::remove(staged, ignored);
+        throw std::runtime_error("could not replace " + destination.string() + ": " + ec.message());
+    }
+    fs::rename(staged, destination, ec);
+    if (ec) {
+        fs::rename(retired, destination, ignored);  // put the old one back
+        throw std::runtime_error("could not install " + destination.string() + ": " + ec.message());
+    }
+    fs::remove(retired, ignored);  // in use while running; cleaned next time
+}
+
+void removeRetiredFiles(const fs::path& installDir) {
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(installDir, ec)) {
+        if (ec) {
+            return;
+        }
+        std::string name = entry.path().filename().string();
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".old") == 0) {
+            std::error_code ignored;
+            fs::remove(entry.path(), ignored);
+        }
+    }
+}
+
+// Extracts one subtree of a .tar.gz into `destination`, dropping the single
+// generated root directory GitHub puts in source tarballs (e.g. "Compiler-a1b2/").
+std::size_t extractSubtreeFromTarGz(const std::string& archive,
+                                    const std::string& subdirectory,
+                                    const fs::path& destination) {
+    auto tarBytes = gzipDecompress(archive, maxSourceArchiveBytes);
+    if (!tarBytes) {
+        throw std::runtime_error("could not decompress the source archive");
+    }
+
+    createDirectory(destination);
+    const std::string wanted = subdirectory + "/";
+    std::size_t written = 0;
+    std::size_t offset = 0;
+
+    while (offset + 512 <= tarBytes->size()) {
+        const char* header = tarBytes->data() + offset;
+        if (zeroTarBlock(header)) {
+            break;
+        }
+        std::string name = tarString(header, 100);
+        std::string prefix = tarString(header + 345, 155);
+        std::string path = prefix.empty() ? name : prefix + "/" + name;
+        std::uint64_t size = readTarOctal(header + 124, 12);
+        char type = header[156];
+        offset += 512;
+
+        if (offset + size > tarBytes->size()) {
+            throw std::runtime_error("source archive is truncated");
+        }
+
+        std::size_t slash = path.find('/');
+        std::string relative = (slash == std::string::npos) ? std::string() : path.substr(slash + 1);
+
+        if ((type == '0' || type == '\0') && startsWith(relative, wanted)) {
+            std::string tail = relative.substr(wanted.size());
+            if (!tail.empty() && safeExtractPath(tail)) {
+                fs::path target = destination / tail;
+                createDirectory(target.parent_path());
+                std::ofstream file(target, std::ios::binary | std::ios::trunc);
+                if (!file.is_open()) {
+                    throw std::runtime_error("could not write " + target.string());
+                }
+                file.write(tarBytes->data() + offset, static_cast<std::streamsize>(size));
+                if (!file) {
+                    throw std::runtime_error("could not write " + target.string());
+                }
+                ++written;
+            }
+        }
+
+        offset += static_cast<std::size_t>((size + 511) / 512 * 512);
+    }
+    return written;
+}
+
+// The compiler resolves `import std::io` as <insty dir>/libs/std/io.ins, so the
+// stdlib must be replaced together with the compiler binary.
+void installStandardLibrary(const fs::path& installDir, const std::string& tag, bool verbose) {
+    std::string url = "https://codeload.github.com/" + std::string(compilerRepo) +
+                      "/tar.gz/refs/tags/" + CloudServer::urlEncode(tag);
+    HttpResult result = httpGet(url, updateHttpHeaders());
+    if (result.status != 200) {
+        throw std::runtime_error("could not download the Compiler source for " + tag +
+                                 " (HTTP " + std::to_string(result.status) + ")");
+    }
+
+    fs::path staging = installDir / "libs.new";
+    fs::remove_all(staging);
+
+    std::size_t count = extractSubtreeFromTarGz(result.body, "libs", staging);
+    if (count == 0) {
+        // Older trees shipped the stdlib as `std/`, installed as `libs/std/`.
+        fs::remove_all(staging);
+        count = extractSubtreeFromTarGz(result.body, "std", staging / "std");
+    }
+    if (count == 0) {
+        fs::remove_all(staging);
+        throw std::runtime_error("the Compiler source archive for " + tag +
+                                 " contained no standard library");
+    }
+
+    fs::path live = installDir / "libs";
+    fs::path retired = installDir / "libs.old";
+    std::error_code ec;
+    fs::remove_all(retired, ec);
+    if (fs::exists(live)) {
+        fs::rename(live, retired, ec);
+        if (ec) {
+            fs::remove_all(staging, ec);
+            throw std::runtime_error("could not replace the standard library: " + ec.message());
+        }
+    }
+    fs::rename(staging, live, ec);
+    if (ec) {
+        fs::rename(retired, live, ec);
+        throw std::runtime_error("could not install the standard library: " + ec.message());
+    }
+    fs::remove_all(retired, ec);
+
+    if (verbose) {
+        std::println("    standard library: {} files -> {}", count, live.string());
+    }
+}
+
+void upgradeCommand(const ParsedArgs& args) {
+    const bool checkOnly = hasFlag(args, "--check");
+    const bool force = hasFlag(args, "--force");
+    const std::string pinned = optionValue(args, "--version");
+
+    fs::path installDir = resolveInstallDir(args);
+    if (!fs::exists(installDir)) {
+        throw std::runtime_error("toolchain directory not found: " + installDir.string() +
+                                 " (pass --install-dir or set INSTY_PREFIX)");
+    }
+    removeRetiredFiles(installDir);
+
+    std::println("Toolchain: {}", installDir.string());
+
+    std::map<std::string, std::string> installed = readToolchainManifest(installDir);
+    std::vector<ToolchainComponent> components = toolchainComponents();
+
+    struct UpdatePlan {
+        ToolchainComponent component;
+        std::string tag;
+        bool outdated = false;
+    };
+    std::vector<UpdatePlan> plans;
+
+    for (const auto& component : components) {
+        std::string tag = pinned.empty() ? latestReleaseTag(component.repo) : pinned;
+        auto found = installed.find(component.name);
+        std::string current = (found == installed.end()) ? std::string() : found->second;
+        bool outdated = force || current.empty() || current != tag;
+
+        std::println("  {:<10} {:>9}  ->  {}{}", component.name,
+                     current.empty() ? "unknown" : current, tag,
+                     outdated ? "" : "   (up to date)");
+        plans.push_back({component, tag, outdated});
+    }
+
+    std::size_t pending = 0;
+    for (const auto& plan : plans) {
+        if (plan.outdated) {
+            ++pending;
+        }
+    }
+
+    if (checkOnly) {
+        if (pending == 0) {
+            std::println("\nThe toolchain is up to date.");
+        } else {
+            std::println("\n{} component{} can be updated. Run: cloud upgrade",
+                         pending, pending == 1 ? "" : "s");
+        }
+        return;
+    }
+
+    if (pending == 0) {
+        std::println("\nAlready up to date. Use --force to reinstall.");
+        return;
+    }
+
+    std::println("");
+    std::vector<std::string> unavailable;
+    std::size_t updated = 0;
+
+    for (const auto& plan : plans) {
+        if (!plan.outdated) {
+            continue;
+        }
+        if (plan.component.asset.empty()) {
+            unavailable.push_back(plan.component.name);
+            continue;
+        }
+
+        std::println("Updating {} to {} ...", plan.component.name, plan.tag);
+        std::string payload =
+            downloadReleaseAsset(plan.component.repo, plan.tag, plan.component.asset);
+        if (args.verbose) {
+            std::println("    downloaded {} bytes (sha256 {})", payload.size(),
+                         CloudServer::sha256Hex(payload).substr(0, 16));
+        }
+
+        fs::path destination = installDir / executableFileName(plan.component.name);
+        installFileAtomic(destination, payload);
+
+        // The compiler and its standard library are versioned together.
+        if (plan.component.name == "insty") {
+            installStandardLibrary(installDir, plan.tag, args.verbose);
+        }
+
+        installed[plan.component.name] = plan.tag;
+        ++updated;
+    }
+
+    if (updated > 0) {
+        writeToolchainManifest(installDir, installed);
+    }
+
+    std::println("");
+    if (updated > 0) {
+        std::println("Updated {} component{}.", updated, updated == 1 ? "" : "s");
+    }
+    if (!unavailable.empty()) {
+        std::string names;
+        for (const auto& name : unavailable) {
+            names += (names.empty() ? "" : ", ") + name;
+        }
+        std::println("No prebuilt release for this platform: {}", names);
+        std::println("Build those from source with install.sh.");
+    }
+}
+
+// Best-effort "a new version is available" notice, at most once a day. Never
+// fails a command: any network/parse problem is swallowed. Skipped entirely on
+// CI, when CLOUD_NO_UPDATE_CHECK is set, and for source installs (no manifest),
+// where there is no release tag to compare against.
+void notifyIfUpdateAvailable(const ParsedArgs& args) {
+    try {
+        if (!getEnv("CLOUD_NO_UPDATE_CHECK").empty() || !getEnv("CI").empty()) {
+            return;
+        }
+
+        fs::path installDir = resolveInstallDir(args);
+        std::map<std::string, std::string> installed = readToolchainManifest(installDir);
+        auto current = installed.find("insty");
+        if (current == installed.end() || current->second.empty()) {
+            return;
+        }
+
+        fs::path stamp = installDir / ".update-check";
+        std::time_t now = std::time(nullptr);
+        {
+            std::ifstream file(stamp);
+            long long last = 0;
+            if (file >> last && now - static_cast<std::time_t>(last) < updateCheckIntervalSeconds) {
+                return;
+            }
+        }
+        {
+            std::ofstream file(stamp, std::ios::trunc);
+            if (file.is_open()) {
+                file << static_cast<long long>(now);
+            }
+        }
+
+        std::string latest = latestReleaseTag(compilerRepo);
+        if (latest != current->second) {
+            std::println("");
+            std::println("A new Insty toolchain is available: {} -> {}", current->second, latest);
+            std::println("Update with: cloud upgrade");
+        }
+    } catch (...) {
+        // A version check must never break the command the user actually ran.
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2164,7 +3095,7 @@ int main(int argc, char** argv) {
         }
 
         if (args.command == "init") {
-            initProject(args.positional.empty() ? "my-insty-project" : args.positional[0]);
+            initCommand(args);
         } else if (args.command == "build") {
             buildProject(args);
         } else if (args.command == "run") {
@@ -2180,6 +3111,8 @@ int main(int argc, char** argv) {
             uninstallCommand(args);
         } else if (args.command == "update") {
             updateCommand(args);
+        } else if (args.command == "upgrade") {
+            upgradeCommand(args);
         } else if (args.command == "list") {
             listCommand();
         } else if (args.command == "yank") {
@@ -2194,6 +3127,13 @@ int main(int argc, char** argv) {
             printHelp();
         } else {
             throw std::runtime_error("unknown command: " + args.command);
+        }
+
+        // Commands that are themselves about versions/help shouldn't nag.
+        if (args.command != "upgrade" && args.command != "version" &&
+            args.command != "-v" && args.command != "--version" &&
+            args.command != "help" && args.command != "-h" && args.command != "--help") {
+            notifyIfUpdateAvailable(args);
         }
 
         curl_global_cleanup();
