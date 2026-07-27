@@ -1,9 +1,29 @@
 #include <cloudServer/core.hpp>
 
-#include <openssl/hmac.h>
-#include <openssl/rand.h>
-#include <openssl/sha.h>
+// Crypto backend: Windows uses the native CNG (bcrypt) API so no OpenSSL build
+// is required; every other platform uses OpenSSL as before.
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <bcrypt.h>
+#  ifndef NT_SUCCESS
+#    define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#  endif
+#else
+#  include <openssl/hmac.h>
+#  include <openssl/rand.h>
+#  include <openssl/sha.h>
+#endif
 #include <zlib.h>
+
+#ifndef SHA256_DIGEST_LENGTH
+#  define SHA256_DIGEST_LENGTH 32
+#endif
 
 #include <algorithm>
 #include <array>
@@ -507,7 +527,11 @@ std::string utcFormat(const char* format) {
     auto now = std::chrono::system_clock::now();
     std::time_t time = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &time);
+#else
     gmtime_r(&time, &tm);
+#endif
     char buffer[32]{};
     std::strftime(buffer, sizeof(buffer), format, &tm);
     return buffer;
@@ -1019,13 +1043,36 @@ std::optional<std::map<std::string, MultipartPart>> parseMultipartForm(
 
 std::string sha256Hex(const std::string& value) {
     unsigned char digest[SHA256_DIGEST_LENGTH];
+#if defined(_WIN32)
+    NTSTATUS status = BCryptHash(BCRYPT_SHA256_ALG_HANDLE,
+                                 nullptr, 0,
+                                 reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
+                                 static_cast<ULONG>(value.size()),
+                                 digest, SHA256_DIGEST_LENGTH);
+    if (!NT_SUCCESS(status)) {
+        throw std::runtime_error("BCryptHash(SHA256) failed");
+    }
+#else
     SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), digest);
+#endif
     return bytesToHex(digest, SHA256_DIGEST_LENGTH);
 }
 
 std::string hmacSha256Bytes(const std::string& key, const std::string& value) {
-    unsigned int length = SHA256_DIGEST_LENGTH;
     unsigned char digest[SHA256_DIGEST_LENGTH];
+#if defined(_WIN32)
+    NTSTATUS status = BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE,
+                                 reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
+                                 static_cast<ULONG>(key.size()),
+                                 reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
+                                 static_cast<ULONG>(value.size()),
+                                 digest, SHA256_DIGEST_LENGTH);
+    if (!NT_SUCCESS(status)) {
+        throw std::runtime_error("BCryptHash(HMAC-SHA256) failed");
+    }
+    return std::string(reinterpret_cast<const char*>(digest), SHA256_DIGEST_LENGTH);
+#else
+    unsigned int length = SHA256_DIGEST_LENGTH;
     HMAC(EVP_sha256(),
          key.data(),
          static_cast<int>(key.size()),
@@ -1034,13 +1081,23 @@ std::string hmacSha256Bytes(const std::string& key, const std::string& value) {
          digest,
          &length);
     return std::string(reinterpret_cast<const char*>(digest), length);
+#endif
 }
 
 std::string randomToken(std::size_t byteCount) {
     std::vector<unsigned char> bytes(byteCount);
+#if defined(_WIN32)
+    NTSTATUS status = BCryptGenRandom(nullptr, bytes.data(),
+                                      static_cast<ULONG>(bytes.size()),
+                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!NT_SUCCESS(status)) {
+        throw std::runtime_error("failed to generate secure random bytes");
+    }
+#else
     if (RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) != 1) {
         throw std::runtime_error("failed to generate secure random bytes");
     }
+#endif
     return "cloud_" + bytesToHex(bytes.data(), bytes.size());
 }
 
