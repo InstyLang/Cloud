@@ -53,7 +53,9 @@ if(WIN32)
     # bcrypt provides SHA256 / HMAC-SHA256 / secure RNG via CNG (no OpenSSL).
     target_link_libraries(InstyCloudCore PUBLIC ZLIB::ZLIB bcrypt)
 
-    add_executable(cloud src/cloud.cpp)
+    # win_print_shim.cpp supplies the two libstdc++ console helpers that the
+    # mingw-w64 builds of libstdc++ omit; it compiles to nothing under MSVC.
+    add_executable(cloud src/cloud.cpp src/platform/win_print_shim.cpp)
     target_link_libraries(cloud PRIVATE InstyCloudCore CURL::libcurl ZLIB::ZLIB)
 else()
     find_package(PkgConfig REQUIRED)

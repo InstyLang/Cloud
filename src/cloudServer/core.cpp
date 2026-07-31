@@ -14,6 +14,15 @@
 #  ifndef NT_SUCCESS
 #    define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #  endif
+// BCryptHash can take a pre-opened pseudo-handle (BCRYPT_SHA256_ALG_HANDLE and
+// friends), but those constants only exist in newer Windows SDK headers --
+// mingw-w64's bcrypt.h has neither, which breaks cross-compiling. Where they
+// are absent, open the algorithm provider explicitly instead: the same CNG
+// primitive, just two extra calls. Deliberately not hard-coding the pseudo-
+// handle values: a wrong constant would silently produce wrong digests.
+#  if !defined(BCRYPT_SHA256_ALG_HANDLE) || !defined(BCRYPT_HMAC_SHA256_ALG_HANDLE)
+#    define INSTY_CNG_OPEN_PROVIDER 1
+#  endif
 #else
 #  include <openssl/hmac.h>
 #  include <openssl/rand.h>
@@ -23,6 +32,47 @@
 
 #ifndef SHA256_DIGEST_LENGTH
 #  define SHA256_DIGEST_LENGTH 32
+#endif
+
+#if defined(INSTY_CNG_OPEN_PROVIDER)
+#include <stdexcept>
+
+namespace {
+
+// Hash `data` with a CNG algorithm opened by name. Passing a key (and hmac=true)
+// selects HMAC using that algorithm as the underlying hash.
+void cngHash(LPCWSTR algorithm, bool hmac,
+             const unsigned char* key, unsigned long keyLength,
+             const unsigned char* data, unsigned long dataLength,
+             unsigned char* digest, unsigned long digestLength) {
+    BCRYPT_ALG_HANDLE algorithmHandle = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(
+        &algorithmHandle, algorithm, nullptr,
+        hmac ? static_cast<ULONG>(BCRYPT_ALG_HANDLE_HMAC_FLAG) : 0u);
+    if (!NT_SUCCESS(status)) {
+        throw std::runtime_error("BCryptOpenAlgorithmProvider failed");
+    }
+
+    BCRYPT_HASH_HANDLE hashHandle = nullptr;
+    status = BCryptCreateHash(algorithmHandle, &hashHandle, nullptr, 0,
+                              const_cast<PUCHAR>(key), keyLength, 0);
+    if (NT_SUCCESS(status)) {
+        status = BCryptHashData(hashHandle, const_cast<PUCHAR>(data), dataLength, 0);
+    }
+    if (NT_SUCCESS(status)) {
+        status = BCryptFinishHash(hashHandle, digest, digestLength, 0);
+    }
+    if (hashHandle) {
+        BCryptDestroyHash(hashHandle);
+    }
+    BCryptCloseAlgorithmProvider(algorithmHandle, 0);
+
+    if (!NT_SUCCESS(status)) {
+        throw std::runtime_error("CNG hashing failed");
+    }
+}
+
+} // namespace
 #endif
 
 #include <algorithm>
@@ -1044,6 +1094,12 @@ std::optional<std::map<std::string, MultipartPart>> parseMultipartForm(
 std::string sha256Hex(const std::string& value) {
     unsigned char digest[SHA256_DIGEST_LENGTH];
 #if defined(_WIN32)
+#  if defined(INSTY_CNG_OPEN_PROVIDER)
+    cngHash(BCRYPT_SHA256_ALGORITHM, /*hmac=*/false, nullptr, 0,
+            reinterpret_cast<const unsigned char*>(value.data()),
+            static_cast<ULONG>(value.size()),
+            digest, SHA256_DIGEST_LENGTH);
+#  else
     NTSTATUS status = BCryptHash(BCRYPT_SHA256_ALG_HANDLE,
                                  nullptr, 0,
                                  reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
@@ -1052,6 +1108,7 @@ std::string sha256Hex(const std::string& value) {
     if (!NT_SUCCESS(status)) {
         throw std::runtime_error("BCryptHash(SHA256) failed");
     }
+#  endif
 #else
     SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), digest);
 #endif
@@ -1061,6 +1118,14 @@ std::string sha256Hex(const std::string& value) {
 std::string hmacSha256Bytes(const std::string& key, const std::string& value) {
     unsigned char digest[SHA256_DIGEST_LENGTH];
 #if defined(_WIN32)
+#  if defined(INSTY_CNG_OPEN_PROVIDER)
+    cngHash(BCRYPT_SHA256_ALGORITHM, /*hmac=*/true,
+            reinterpret_cast<const unsigned char*>(key.data()),
+            static_cast<ULONG>(key.size()),
+            reinterpret_cast<const unsigned char*>(value.data()),
+            static_cast<ULONG>(value.size()),
+            digest, SHA256_DIGEST_LENGTH);
+#  else
     NTSTATUS status = BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE,
                                  reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
                                  static_cast<ULONG>(key.size()),
@@ -1070,6 +1135,7 @@ std::string hmacSha256Bytes(const std::string& key, const std::string& value) {
     if (!NT_SUCCESS(status)) {
         throw std::runtime_error("BCryptHash(HMAC-SHA256) failed");
     }
+#  endif
     return std::string(reinterpret_cast<const char*>(digest), SHA256_DIGEST_LENGTH);
 #else
     unsigned int length = SHA256_DIGEST_LENGTH;
