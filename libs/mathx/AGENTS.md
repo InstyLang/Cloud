@@ -95,7 +95,7 @@ the compiler, in the `AGENTS.md` beside the `insty` toolchain, and that copy is 
 one kept current and checked against the compiler -- its examples are compiled as
 part of the compiler's own test pass. A per-project copy would drift instead.
 
-Look there for: types and literals, structs/classes/enums, sum types and `match`,
+Look there for: types and literals, structs/classes/enums, sum types and `switch`,
 generics, slices, `for`-in, `.insize` / `.inalign`, the builtin list, the standard
 library layout, compile-time `#if` and `@targetIs`, the unsafe boundary, volatile
 and atomics, inline `asm`, freestanding/OS development, custom target specs, and
@@ -125,3 +125,4 @@ fun main() -> i32 {
 - Keep unsafe operations inside explicit `unsafe { ... }` blocks.
 - For kernels, prefer explicit `--target <spec.toml> --freestanding --entry <symbol>`.
 - Keep target-specific boot/linker details in target specs and linker scripts.
+
