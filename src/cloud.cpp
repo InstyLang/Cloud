@@ -2287,14 +2287,15 @@ void tokenCommand(const ParsedArgs& args) {
 constexpr std::size_t maxSourceArchiveBytes = 256u * 1024u * 1024u;
 constexpr std::time_t updateCheckIntervalSeconds = 24 * 60 * 60;
 
-// Toolchain assets are hosted on the Insty MinIO (public read through Caddy):
-//     https://dl.insty.land/insty-downloads/toolchain/manifest.txt
-//     https://dl.insty.land/insty-downloads/toolchain/<tag>/<asset>
-//     https://dl.insty.land/insty-downloads/toolchain/<tag>/stdlib.tar.gz
+// Toolchain assets are hosted on the Insty MinIO (public read through the
+// dl.insty.land proxy, which maps the URL path onto the insty-downloads
+// bucket): 
+//     https://dl.insty.land/toolchain/manifest.txt
+//     https://dl.insty.land/toolchain/<tag>/<asset>
+//     https://dl.insty.land/toolchain/<tag>/stdlib.tar.gz
 // manifest.txt is "<component> <tag>" per line, the same shape toolchain.txt
 // uses locally. CLOUD_TOOLCHAIN_URL overrides the base for mirrors/testing.
-constexpr const char* defaultToolchainUrl =
-    "https://dl.insty.land/insty-downloads/toolchain";
+constexpr const char* defaultToolchainUrl = "https://dl.insty.land/toolchain";
 
 std::string toolchainBaseUrl() {
     std::string url = CloudServer::trimCopy(getEnv("CLOUD_TOOLCHAIN_URL"));
