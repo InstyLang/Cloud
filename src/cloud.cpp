@@ -2429,8 +2429,11 @@ void writeToolchainManifest(const fs::path& installDir,
 
 // The MinIO manifest: "<component> <tag>" per line. One cheap unauthenticated
 // GET tells us every component's latest tag -- no rate-limited API involved.
+// A fresh query string bypasses the Cloudflare edge cache on every run: an
+// upgrade must always see the newest manifest.
 std::map<std::string, std::string> fetchToolchainManifest() {
-    HttpResult result = httpGet(toolchainBaseUrl() + "/manifest.txt",
+    HttpResult result = httpGet(toolchainBaseUrl() + "/manifest.txt?t=" +
+                                    std::to_string(std::time(nullptr)),
                                 updateHttpHeaders());
     if (result.status != 200) {
         throw std::runtime_error("could not download the toolchain manifest (HTTP " +
@@ -2449,8 +2452,11 @@ std::map<std::string, std::string> fetchToolchainManifest() {
 }
 
 std::string downloadToolchainAsset(const std::string& tag, const std::string& asset) {
+    // Tag-scoped query: assets at a tag are immutable, so edge caching works
+    // per version and a new tag always fetches fresh content.
     std::string url = toolchainBaseUrl() + "/" + CloudServer::urlEncode(tag) +
-                      "/" + CloudServer::urlEncode(asset);
+                      "/" + CloudServer::urlEncode(asset) + "?v=" +
+                      CloudServer::urlEncode(tag);
     HttpResult result = httpGet(url, updateHttpHeaders());
     if (result.status != 200) {
         throw std::runtime_error("could not download " + asset + " " + tag +
@@ -2589,7 +2595,7 @@ std::size_t extractSubtreeFromTarGz(const std::string& archive,
 // `libs/` entry, so the "std" fallback shape below also matches).
 void installStandardLibrary(const fs::path& installDir, const std::string& tag, bool verbose) {
     std::string url = toolchainBaseUrl() + "/" + CloudServer::urlEncode(tag) +
-                      "/stdlib.tar.gz";
+                      "/stdlib.tar.gz?v=" + CloudServer::urlEncode(tag);
     HttpResult result = httpGet(url, updateHttpHeaders());
     if (result.status != 200) {
         throw std::runtime_error("could not download the standard library for " + tag +
