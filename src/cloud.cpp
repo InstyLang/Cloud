@@ -1161,6 +1161,30 @@ void syncInstalledModules(bool verbose = false) {
     }
 }
 
+// Copies each installed dependency's vendored native binaries for the active
+// target (bin/<target>/) next to the built executable, so the OS loader finds
+// them at runtime (Windows: the DLL sits beside the exe; this is what makes
+// FFI-binding packages zero-install for consumers). Pure-Insty packages have
+// no bin/ and contribute nothing.
+void stageDependencyBinaries(const std::string& target, const fs::path& outputDir, bool verbose) {
+    for (const auto& entry : readLockFile()) {
+        fs::path binDir = fs::path(".cloud/libs") / entry.owner / entry.packageName / entry.version / "bin" / target;
+        if (!fs::exists(binDir)) {
+            continue;
+        }
+        for (const auto& file : fs::recursive_directory_iterator(binDir)) {
+            if (!file.is_regular_file()) {
+                continue;
+            }
+            fs::path dest = outputDir / file.path().filename();
+            fs::copy_file(file.path(), dest, fs::copy_options::overwrite_existing);
+            if (verbose) {
+                std::println("Staged dependency binary: {}", dest.string());
+            }
+        }
+    }
+}
+
 void buildProject(const ParsedArgs& args) {
     ProjectConfig config = loadProjectConfig(configFilePath(args));
     // Command-line --target/--linker override config.toml for this build.
@@ -1225,6 +1249,10 @@ void buildProject(const ParsedArgs& args) {
     int result = runSystemCommand(command);
     if (result != 0) {
         throw std::runtime_error("build failed with exit code: " + std::to_string(result));
+    }
+
+    if (config.outputFormat == "executable") {
+        stageDependencyBinaries(config.target, outputDir, args.verbose);
     }
 
     std::println("Build successful!");
@@ -1635,6 +1663,11 @@ bool allowedPublishPath(const fs::path& relative) {
     if (startsWith(path, "src/")) return true;
     if (startsWith(path, "include/")) return true;
     if (startsWith(path, "docs/")) return true;
+    // Vendored native binaries for FFI-binding packages, laid out per target:
+    //   bin/x86_64_windows/zlib1.dll
+    //   bin/x86_64_linux/libz.so.1
+    // `cloud build` stages the active target's contents next to the exe.
+    if (startsWith(path, "bin/")) return true;
     if (path.find('/') == std::string::npos) {
         return startsWith(path, "README") || startsWith(path, "LICENSE");
     }
@@ -1648,7 +1681,7 @@ std::vector<fs::path> collectPublishFiles() {
             files.push_back(root);
         }
     }
-    for (const fs::path& root : {fs::path("src"), fs::path("include"), fs::path("docs")}) {
+    for (const fs::path& root : {fs::path("src"), fs::path("include"), fs::path("docs"), fs::path("bin")}) {
         if (!fs::exists(root)) {
             continue;
         }
