@@ -2284,39 +2284,51 @@ void tokenCommand(const ParsedArgs& args) {
 // tag and swapped in next to `insty`.
 // ---------------------------------------------------------------------------
 
-constexpr const char* compilerRepo = "InstyLang/Compiler";
-constexpr const char* lspRepo = "InstyLang/LSP";
-constexpr const char* cloudRepo = "InstyLang/Cloud";
 constexpr std::size_t maxSourceArchiveBytes = 256u * 1024u * 1024u;
 constexpr std::time_t updateCheckIntervalSeconds = 24 * 60 * 60;
 
+// Toolchain assets are hosted on the Insty MinIO (public read through Caddy):
+//     https://dl.insty.land/insty-downloads/toolchain/manifest.txt
+//     https://dl.insty.land/insty-downloads/toolchain/<tag>/<asset>
+//     https://dl.insty.land/insty-downloads/toolchain/<tag>/stdlib.tar.gz
+// manifest.txt is "<component> <tag>" per line, the same shape toolchain.txt
+// uses locally. CLOUD_TOOLCHAIN_URL overrides the base for mirrors/testing.
+constexpr const char* defaultToolchainUrl =
+    "https://dl.insty.land/insty-downloads/toolchain";
+
+std::string toolchainBaseUrl() {
+    std::string url = CloudServer::trimCopy(getEnv("CLOUD_TOOLCHAIN_URL"));
+    while (!url.empty() && url.back() == '/') {
+        url.pop_back();
+    }
+    return url.empty() ? std::string(defaultToolchainUrl) : url;
+}
+
 struct ToolchainComponent {
     std::string name;   // logical name; also the installed file stem
-    std::string repo;   // GitHub owner/repo publishing the release
-    std::string asset;  // release asset for this platform ("" = none published)
+    std::string asset;  // MinIO object name for this platform ("" = none)
 };
 
-// Release assets are currently published for Linux x86-64 (and Windows for the
-// compiler + LSP). Where no asset exists, upgrade reports it instead of
-// silently skipping, so the user knows to build from source via install.sh.
+// Every component has an asset for Windows and Linux x86-64. macOS builds
+// remain source-only for now; upgrade reports that instead of skipping.
 std::vector<ToolchainComponent> toolchainComponents() {
 #if defined(_WIN32)
     return {
-        {"insty", compilerRepo, "insty-windows-x86_64.exe"},
-        {"insty-lsp", lspRepo, "insty-lsp-windows-x86_64.exe"},
-        {"cloud", cloudRepo, ""},
+        {"insty", "insty-windows-x86_64.exe"},
+        {"insty-lsp", "insty-lsp-windows-x86_64.exe"},
+        {"cloud", "cloud-windows-x86_64.exe"},
     };
 #elif defined(__APPLE__)
     return {
-        {"insty", compilerRepo, ""},
-        {"insty-lsp", lspRepo, ""},
-        {"cloud", cloudRepo, ""},
+        {"insty", ""},
+        {"insty-lsp", ""},
+        {"cloud", ""},
     };
 #else
     return {
-        {"insty", compilerRepo, "insty"},
-        {"insty-lsp", lspRepo, "insty-lsp"},
-        {"cloud", cloudRepo, "cloud"},
+        {"insty", "insty"},
+        {"insty-lsp", "insty-lsp"},
+        {"cloud", "cloud"},
     };
 #endif
 }
@@ -2414,39 +2426,33 @@ void writeToolchainManifest(const fs::path& installDir,
     }
 }
 
-// GitHub redirects /releases/latest to /releases/tag/<tag>, so the effective
-// URL yields the tag without spending an API call (the REST API is rate-limited
-// to 60 requests/hour for unauthenticated clients).
-std::string latestReleaseTag(const std::string& repo) {
-    HttpResult result = httpGet("https://github.com/" + repo + "/releases/latest",
+// The MinIO manifest: "<component> <tag>" per line. One cheap unauthenticated
+// GET tells us every component's latest tag -- no rate-limited API involved.
+std::map<std::string, std::string> fetchToolchainManifest() {
+    HttpResult result = httpGet(toolchainBaseUrl() + "/manifest.txt",
                                 updateHttpHeaders());
-    if (result.status < 200 || result.status >= 400) {
-        throw std::runtime_error("could not query the latest release of " + repo +
-                                 " (HTTP " + std::to_string(result.status) + ")");
+    if (result.status != 200) {
+        throw std::runtime_error("could not download the toolchain manifest (HTTP " +
+                                 std::to_string(result.status) + ")");
     }
-    constexpr std::string_view marker = "/releases/tag/";
-    std::size_t position = result.finalUrl.rfind(marker);
-    if (position == std::string::npos) {
-        throw std::runtime_error(repo + " has no published releases yet");
+    std::map<std::string, std::string> versions;
+    std::stringstream lines(result.body);
+    std::string name, tag;
+    while (lines >> name >> tag) {
+        versions[name] = tag;
     }
-    std::string tag = result.finalUrl.substr(position + marker.size());
-    std::size_t cut = tag.find_first_of("?#");
-    if (cut != std::string::npos) {
-        tag = tag.substr(0, cut);
+    if (versions.empty()) {
+        throw std::runtime_error("the toolchain manifest was empty or malformed");
     }
-    if (tag.empty()) {
-        throw std::runtime_error("could not parse the latest release tag for " + repo);
-    }
-    return tag;
+    return versions;
 }
 
-std::string downloadReleaseAsset(const std::string& repo, const std::string& tag,
-                                 const std::string& asset) {
-    std::string url = "https://github.com/" + repo + "/releases/download/" +
-                      CloudServer::urlEncode(tag) + "/" + CloudServer::urlEncode(asset);
+std::string downloadToolchainAsset(const std::string& tag, const std::string& asset) {
+    std::string url = toolchainBaseUrl() + "/" + CloudServer::urlEncode(tag) +
+                      "/" + CloudServer::urlEncode(asset);
     HttpResult result = httpGet(url, updateHttpHeaders());
     if (result.status != 200) {
-        throw std::runtime_error("could not download " + asset + " " + tag + " from " + repo +
+        throw std::runtime_error("could not download " + asset + " " + tag +
                                  " (HTTP " + std::to_string(result.status) + ")");
     }
     if (result.body.empty()) {
@@ -2577,13 +2583,15 @@ std::size_t extractSubtreeFromTarGz(const std::string& archive,
 }
 
 // The compiler resolves `import std::io` as <insty dir>/libs/std/io.ins, so the
-// stdlib must be replaced together with the compiler binary.
+// stdlib must be replaced together with the compiler binary. The archive is
+// published next to the toolchain assets as <tag>/stdlib.tar.gz (top-level
+// `libs/` entry, so the "std" fallback shape below also matches).
 void installStandardLibrary(const fs::path& installDir, const std::string& tag, bool verbose) {
-    std::string url = "https://codeload.github.com/" + std::string(compilerRepo) +
-                      "/tar.gz/refs/tags/" + CloudServer::urlEncode(tag);
+    std::string url = toolchainBaseUrl() + "/" + CloudServer::urlEncode(tag) +
+                      "/stdlib.tar.gz";
     HttpResult result = httpGet(url, updateHttpHeaders());
     if (result.status != 200) {
-        throw std::runtime_error("could not download the Compiler source for " + tag +
+        throw std::runtime_error("could not download the standard library for " + tag +
                                  " (HTTP " + std::to_string(result.status) + ")");
     }
 
@@ -2641,6 +2649,7 @@ void upgradeCommand(const ParsedArgs& args) {
 
     std::map<std::string, std::string> installed = readToolchainManifest(installDir);
     std::vector<ToolchainComponent> components = toolchainComponents();
+    std::map<std::string, std::string> available = fetchToolchainManifest();
 
     struct UpdatePlan {
         ToolchainComponent component;
@@ -2650,7 +2659,13 @@ void upgradeCommand(const ParsedArgs& args) {
     std::vector<UpdatePlan> plans;
 
     for (const auto& component : components) {
-        std::string tag = pinned.empty() ? latestReleaseTag(component.repo) : pinned;
+        auto avail = available.find(component.name);
+        if (avail == available.end() && pinned.empty()) {
+            std::println("  {:<10} (not published on the toolchain host yet)",
+                         component.name);
+            continue;
+        }
+        std::string tag = pinned.empty() ? avail->second : pinned;
         auto found = installed.find(component.name);
         std::string current = (found == installed.end()) ? std::string() : found->second;
         bool outdated = force || current.empty() || current != tag;
@@ -2698,7 +2713,7 @@ void upgradeCommand(const ParsedArgs& args) {
 
         std::println("Updating {} to {} ...", plan.component.name, plan.tag);
         std::string payload =
-            downloadReleaseAsset(plan.component.repo, plan.tag, plan.component.asset);
+            downloadToolchainAsset(plan.tag, plan.component.asset);
         if (args.verbose) {
             std::println("    downloaded {} bytes (sha256 {})", payload.size(),
                          CloudServer::sha256Hex(payload).substr(0, 16));
@@ -2767,8 +2782,11 @@ void notifyIfUpdateAvailable(const ParsedArgs& args) {
             }
         }
 
-        std::string latest = latestReleaseTag(compilerRepo);
-        if (latest != current->second) {
+        std::map<std::string, std::string> available = fetchToolchainManifest();
+        auto latestIt = available.find("insty");
+        const std::string latest =
+            latestIt == available.end() ? std::string() : latestIt->second;
+        if (!latest.empty() && latest != current->second) {
             std::println("");
             std::println("A new Insty toolchain is available: {} -> {}", current->second, latest);
             std::println("Update with: cloud upgrade");
