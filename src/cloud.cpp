@@ -2318,18 +2318,21 @@ std::vector<ToolchainComponent> toolchainComponents() {
         {"insty", "insty-windows-x86_64.exe"},
         {"insty-lsp", "insty-lsp-windows-x86_64.exe"},
         {"cloud", "cloud-windows-x86_64.exe"},
+        {"insbind", "insbind-windows-x86_64.exe"},
     };
 #elif defined(__APPLE__)
     return {
         {"insty", ""},
         {"insty-lsp", ""},
         {"cloud", ""},
+        {"insbind", ""},
     };
 #else
     return {
         {"insty", "insty"},
         {"insty-lsp", "insty-lsp"},
         {"cloud", "cloud"},
+        {"insbind", "insbind"},
     };
 #endif
 }
