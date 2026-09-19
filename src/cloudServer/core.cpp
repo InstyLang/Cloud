@@ -467,6 +467,11 @@ bool allowedArchivePath(std::string path) {
     if (path == "docs" || startsWith(path, "docs/")) {
         return true;
     }
+    // Vendored native binaries for FFI-binding packages (bin/<target>/...);
+    // cloud build stages the active target's files next to the consumer's exe.
+    if (path == "bin" || startsWith(path, "bin/")) {
+        return true;
+    }
     if (path.find('/') == std::string::npos) {
         return startsWith(path, "README") || startsWith(path, "LICENSE");
     }

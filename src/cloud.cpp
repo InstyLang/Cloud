@@ -1269,9 +1269,9 @@ void runProject(const ParsedArgs& args) {
 #if defined(_WIN32)
     executablePath += ".exe";
 #endif
-    if (!fs::exists(executablePath)) {
-        throw std::runtime_error("Executable not found. Run 'cloud build' first.");
-    }
+    // cargo-style: build first, then run -- `cloud run` is one command, never
+    // "Executable not found. Run 'cloud build' first."
+    buildProject(args);
 
     std::string command = shellQuote(executablePath);
     if (args.verbose) {
@@ -1533,6 +1533,17 @@ HttpResult httpPostMultipart(
     curl_slist* headers = nullptr;
     std::string authorization = "Authorization: Bearer " + token;
     headers = curl_slist_append(headers, authorization.c_str());
+    // SvelteKit's CSRF guard rejects multipart POSTs whose Origin does not
+    // match the origin the app computes. Behind a proxy that the Bun adapter
+    // does not trust, that computed origin is http (X-Forwarded-Proto is
+    // ignored), so send http even for https registries; guards that compute
+    // correctly or do not check at all are unaffected either way.
+    std::string origin = url.substr(0, url.find('/', url.find("://") + 3));
+    if (origin.rfind("https://", 0) == 0) {
+        origin = "http://" + origin.substr(8);
+    }
+    std::string originHeader = "Origin: " + origin;
+    headers = curl_slist_append(headers, originHeader.c_str());
 
     curl_mime* mime = curl_mime_init(curl);
     curl_mimepart* manifestPart = curl_mime_addpart(mime);
