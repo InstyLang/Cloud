@@ -82,9 +82,19 @@ inline bool& colorPref() {
 }
 inline void setColorPref(bool enabled) { colorPref() = enabled; }
 
+// --silent: cloud prints nothing (steps, tree, summaries, its own error
+// line). The compiler's diagnostics still flow, and `run` lets the program
+// print -- only cloud's own output is silenced. Exit codes are unaffected.
+inline bool& silentMode() {
+    static bool v = false;
+    return v;
+}
+inline void setSilent(bool enabled) { silentMode() = enabled; }
+inline bool silent() { return silentMode(); }
+
 inline bool color() {
     static const bool dflt = detail::colorDefault();
-    return dflt && colorPref();
+    return dflt && colorPref() && !silent();
 }
 
 inline const char* kReset  = "\x1b[0m";
@@ -99,26 +109,31 @@ inline const char* style(const char* code) { return color() ? code : ""; }
 
 // [ i/n] text -- legacy flat step line (kept for non-build callers).
 inline void step(int index, int total, const std::string& text) {
+    if (silent()) return;
     std::fprintf(stdout, "%s[%d/%d]%s %s%s%s\n", style(kDim), index, total,
                  style(kReset), style(kCyan), text.c_str(), style(kReset));
     std::fflush(stdout);
 }
 
 inline void ok(const std::string& text) {
+    if (silent()) return;
     std::fprintf(stdout, "%sOK%s   %s\n", style(kGreen), style(kReset), text.c_str());
     std::fflush(stdout);
 }
 
 inline void err(const std::string& text) {
+    if (silent()) return;
     std::fprintf(stderr, "%serror%s %s\n", style(kRed), style(kReset), text.c_str());
     std::fflush(stderr);
 }
 
 inline void note(const std::string& text) {
+    if (silent()) return;
     std::fprintf(stderr, "%snote%s %s\n", style(kYellow), style(kReset), text.c_str());
 }
 
 inline void dim(const std::string& text) {
+    if (silent()) return;
     std::fprintf(stdout, "%s%s%s\n", style(kDim), text.c_str(), style(kReset));
 }
 
@@ -133,6 +148,7 @@ inline void dim(const std::string& text) {
 class Stepper {
 public:
     explicit Stepper(std::string project) : project_(std::move(project)) {
+        if (silent()) return;
         std::fprintf(stdout, "%s%s%s\n", style(kBold), project_.c_str(), style(kReset));
         std::fflush(stdout);
     }
@@ -147,6 +163,7 @@ public:
 
     // A long-running child step: its line ticks elapsed time in place.
     void begin(const std::string& name, bool last = false) {
+        if (silent()) return;
         name_ = name;
         last_ = last;
         t0_ = std::chrono::steady_clock::now();
@@ -194,6 +211,7 @@ private:
 
     void printChild(const std::string& text, const std::string& suffix,
                     bool last, bool good = true) {
+        if (silent()) return;
         const bool fancy = color();
         // UTF-8 tree glyphs as hex escapes: correct regardless of the source
         // encoding MSVC assumes (no /utf-8 in the build).

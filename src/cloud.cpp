@@ -47,7 +47,8 @@ struct ParsedArgs {
     std::map<std::string, std::string> values;
     bool verbose = false;
     bool release = false;
-    bool yes = false;  // -y / --yes: accept defaults, skip interactive prompts
+    bool yes = false;
+    bool silent = false;   // --silent: no build output, exit code only
 };
 
 struct ProjectConfig {
@@ -246,6 +247,8 @@ ParsedArgs parseArgs(int argc, char** argv) {
             args.verbose = true;
         } else if (value == "--release") {
             args.release = true;
+        } else if (value == "--silent") {
+            args.silent = true;
         } else if (value == "-y" || value == "--yes") {
             args.yes = true;
         } else if (isFlagWithValue(value)) {
@@ -374,6 +377,7 @@ void printHelp() {
     std::println("  --config <file>              Use specific config file");
     std::println("  --check                      upgrade: report available updates only");
     std::println("  --force                      upgrade: reinstall even if up to date");
+    std::println("  --silent                     build/run: no build output, exit code only");
     std::println("  --install-dir <dir>          upgrade: toolchain dir, default INSTY_PREFIX/libexec");
     std::println("  -y, --yes                    init: accept defaults, skip the wizard");
     std::println("  --kind <kind>                init: executable|library|freestanding|uefi");
@@ -1198,6 +1202,7 @@ int stageDependencyBinaries(const std::string& target, const fs::path& outputDir
 
 void buildProject(const ParsedArgs& args) {
     const auto t0 = std::chrono::steady_clock::now();
+    term::setSilent(args.silent);
     ProjectConfig config = loadProjectConfig(configFilePath(args));
     term::setColorPref(config.coloredOutput);
     // Command-line --target/--linker override config.toml for this build.
@@ -1293,9 +1298,6 @@ void runProject(const ParsedArgs& args) {
 #if defined(_WIN32)
     executablePath += ".exe";
 #endif
-    // cargo-style: build first, then run -- `cloud run` is one command, never
-    // "Executable not found. Run 'cloud build' first."
-    buildProject(args);
 
     std::string command = shellQuote(executablePath);
     if (args.verbose) {
@@ -2796,11 +2798,11 @@ void upgradeCommand(const ParsedArgs& args) {
 
 // Best-effort "a new version is available" notice, at most once a day. Never
 // fails a command: any network/parse problem is swallowed. Skipped entirely on
-// CI, when CLOUD_NO_UPDATE_CHECK is set, and for source installs (no manifest),
-// where there is no release tag to compare against.
+// CI, when CLOUD_NO_UPDATE_CHECK is set, for source installs (no manifest),
+// and under --silent.
 void notifyIfUpdateAvailable(const ParsedArgs& args) {
     try {
-        if (!getEnv("CLOUD_NO_UPDATE_CHECK").empty() || !getEnv("CI").empty()) {
+        if (args.silent || !getEnv("CLOUD_NO_UPDATE_CHECK").empty() || !getEnv("CI").empty()) {
             return;
         }
 
