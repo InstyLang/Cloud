@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* versionText = "0.2.0";
-constexpr const char* defaultRegistryUrl = "https://ecliptix-web.insty.workers.dev";
+constexpr const char* defaultRegistryUrl = "https://pkg.insty.land";
 constexpr std::size_t defaultMaxPackageBytes = 50 * 1024 * 1024;
 
 struct ParsedArgs {
