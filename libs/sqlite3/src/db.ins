@@ -1,0 +1,149 @@
+// @ecx/sqlite3: the idiomatic wrapper (hand-maintained, NOT generated).
+//
+// RAII over the raw bindings: a Database closes itself, a Statement
+// finalizes itself, and every unsafe block lives inside this module. Usage:
+//
+//   import ecx::sqlite3::db
+//
+//   db.Database database
+//   if database.open_memory() != 0 { return 1 }
+//   database.exec("CREATE TABLE team(name TEXT, score INTEGER)")
+//   db.Statement stmt
+//   if db.prepare(&database, &stmt, "SELECT score FROM team WHERE name = ?") == 0 {
+//       stmt.bind_text(1, "beta")
+//       if stmt.step() == sqlite3.sqlite_row() {
+//           i32 s = stmt.column_int(0)
+//       }
+//   }
+//   // stmt finalized, database closed -- automatically, on scope exit.
+//
+// Caller-owns pattern: prepare() and create() fill a value you declare, so
+// no RAII value is ever copied (a copy would double-finalize).
+
+module db
+
+import ecx::sqlite3
+
+export class Database {
+    u64 handle
+    bool is_open
+
+    constructor() {
+        this.handle = 0
+        this.is_open = false
+    }
+
+    destructor() -> void {
+        this.close()
+    }
+
+    fun open_memory() -> i32 {
+        return this.open_path(":memory:")
+    }
+
+    fun open_path(text path) -> i32 {
+        i32 rc = 0
+        unsafe {
+            rc = sqlite3.sqlite3_open(path, &this.handle)
+        }
+        this.is_open = rc == 0
+        if rc != 0 {
+            this.handle = 0
+        }
+        return rc
+    }
+
+    fun close() -> void {
+        if this.is_open {
+            unsafe {
+                sqlite3.sqlite3_close(this.handle)
+            }
+            this.is_open = false
+        }
+        this.handle = 0
+    }
+
+    // Executes one or more statements, discarding results. Returns the raw
+    // SQLITE code (0 == SQLITE_OK).
+    fun exec(text sql) -> i32 {
+        i32 rc = 0
+        unsafe {
+            rc = sqlite3.sqlite3_exec(this.handle, sql, 0, cast<void*>(0),
+                                      cast<u8**>(0))
+        }
+        return rc
+    }
+}
+
+export class Statement {
+    u64 handle
+
+    constructor() {
+        this.handle = 0
+    }
+
+    destructor() -> void {
+        if this.handle != 0 {
+            unsafe {
+                sqlite3.sqlite3_finalize(this.handle)
+            }
+            this.handle = 0
+        }
+    }
+
+    fun bind_text(i32 idx, text value) -> i32 {
+        i32 rc = 0
+        unsafe {
+            rc = sqlite3.sqlite3_bind_text(this.handle, idx, value, 0 - 1, 0)
+        }
+        return rc
+    }
+
+    fun bind_int(i32 idx, i32 value) -> i32 {
+        i32 rc = 0
+        unsafe {
+            rc = sqlite3.sqlite3_bind_int(this.handle, idx, value)
+        }
+        return rc
+    }
+
+    // Returns the raw SQLITE code: sqlite3.sqlite_row() (a row is ready),
+    // sqlite3.sqlite_done() (finished), or an error.
+    fun step() -> i32 {
+        i32 rc = 0
+        unsafe {
+            rc = sqlite3.sqlite3_step(this.handle)
+        }
+        return rc
+    }
+
+    fun column_int(i32 col) -> i32 {
+        i32 v = 0
+        unsafe {
+            v = sqlite3.sqlite3_column_int(this.handle, col)
+        }
+        return v
+    }
+
+    fun column_i64(i32 col) -> i64 {
+        i64 v = 0
+        unsafe {
+            v = sqlite3.sqlite3_column_int64(this.handle, col)
+        }
+        return v
+    }
+}
+
+// Fills `stmt` with a prepared statement for `sql` on `database`. Returns
+// the raw SQLITE code (0 == SQLITE_OK). On error, stmt.handle stays 0.
+export fun prepare(Database* database, Statement* stmt, text sql) -> i32 {
+    i32 rc = 0
+    unsafe {
+        rc = sqlite3.sqlite3_prepare_v2(database.handle, sql, 0 - 1,
+                                        &stmt.handle, cast<text*>(0))
+    }
+    if rc != 0 {
+        stmt.handle = 0
+    }
+    return rc
+}

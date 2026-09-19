@@ -1,0 +1,20 @@
+# Insty Project Configuration
+
+[project]
+name = "@ecx/glad"
+version = "3.3.0"
+description = "FFI bindings for OpenGL 3.3 core (glad-generated header, bound by insbind): GL types and ~2000 constants, with the vendored loader library -- GL entry points resolve via wglGetProcAddress + fnCall"
+authors = ["ecx"]
+license = "MIT"
+main = "src/gl.ins"
+module = "gl"
+
+[compiler]
+optimization_level = 0
+output_format = "executable"
+
+[paths]
+module_search_paths = [".", "src"]
+output_dir = ".cloud/objects"
+
+[dependencies]

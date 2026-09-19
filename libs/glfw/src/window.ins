@@ -1,0 +1,122 @@
+// @ecx/glfw: the idiomatic wrapper (hand-maintained, NOT generated).
+//
+// RAII over the raw bindings: a Window destroys itself, library init is
+// reference-counted, and every unsafe block lives inside this module.
+// Usage:
+//
+//   import ecx::glfw::window
+//
+//   if window.init() == 0 { return 1 }
+//   window.Window w
+//   if !window.create(&w, 640, 480, "hello") { return 2 }
+//   while !window.should_close(&w) {
+//       window.poll()
+//       window.swap(&w)
+//   }
+//   window.terminate()
+//   // w destroyed on scope exit; the library tears down at refcount 0.
+
+module window
+
+import ecx::glfw
+
+i32 g_init_count = 0
+
+// Initializes GLFW on the first call and bumps a reference count. Returns
+// the raw glfwInit result on the first call, 1 when already initialized.
+export fun init() -> i32 {
+    if g_init_count > 0 {
+        g_init_count = g_init_count + 1
+        return 1
+    }
+    i32 rc = 0
+    unsafe {
+        rc = glfw.glfwInit()
+    }
+    if rc != 0 {
+        g_init_count = 1
+    }
+    return rc
+}
+
+// Drops one reference; calls glfwTerminate when the last one goes away.
+export fun terminate() -> void {
+    g_init_count = g_init_count - 1
+    if g_init_count <= 0 {
+        g_init_count = 0
+        unsafe {
+            glfw.glfwTerminate()
+        }
+    }
+}
+
+export class Window {
+    u64 handle
+
+    constructor() {
+        this.handle = 0
+    }
+
+    destructor() -> void {
+        if this.handle != 0 {
+            unsafe {
+                glfw.glfwDestroyWindow(this.handle)
+            }
+            this.handle = 0
+        }
+    }
+
+    fun should_close() -> bool {
+        i32 v = 1
+        unsafe {
+            v = glfw.glfwWindowShouldClose(this.handle)
+        }
+        return v != 0
+    }
+
+    fun set_should_close(bool value) -> void {
+        unsafe {
+            glfw.glfwSetWindowShouldClose(this.handle, cast<i32>(value))
+        }
+    }
+
+    fun swap() -> void {
+        unsafe {
+            glfw.glfwSwapBuffers(this.handle)
+        }
+    }
+
+    fun make_context_current() -> void {
+        unsafe {
+            glfw.glfwMakeContextCurrent(this.handle)
+        }
+    }
+}
+
+// Fills `w` with a window of the given size/title. Returns false on failure.
+export fun create(Window* w, i32 width, i32 height, text title) -> bool {
+    unsafe {
+        w.handle = glfw.glfwCreateWindow(width, height, title, 0, 0)
+    }
+    return w.handle != 0
+}
+
+// Same, but the window is never shown (headless runs, CI, offscreen tests).
+export fun create_hidden(Window* w, i32 width, i32 height, text title) -> bool {
+    unsafe {
+        glfw.glfwWindowHint(glfw.glfw_visible(), 0)
+    }
+    return create(w, width, height, title)
+}
+
+export fun poll() -> void {
+    unsafe {
+        glfw.glfwPollEvents()
+    }
+}
+
+export fun wait_events() -> void {
+    unsafe {
+        glfw.glfwWaitEvents()
+    }
+}

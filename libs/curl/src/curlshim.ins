@@ -1,0 +1,26 @@
+// @ecx/curl: insty-curl-shim bindings (hand-maintained, NOT generated).
+//
+// Fixed-arity wrappers over libcurl's variadic easy interface (Insty cannot
+// call variadic functions). Every curl_easy_setopt/curl_easy_getinfo call
+// routes through one of these, picked by the argument class:
+//
+//   long        -> insty_setopt_long   (timeouts, ports, booleans, SSL opts)
+//   pointer     -> insty_setopt_ptr    (callbacks via cast<void*>(&fn), data)
+//   string      -> insty_setopt_str    (URL, headers, credentials)
+//   curl_off_t  -> insty_setopt_off    (sizes, speeds)
+//   long*       -> insty_getinfo_long  (response code, redirect count)
+//   curl_off_t* -> insty_getinfo_off   (download sizes, times)
+//   pointer     -> insty_getinfo_ptr   (strings, slists, sockets)
+//
+// Option/info constants live in the generated curl module:
+// curl.curlopt_url(), curl.curlopt_timeout(), curl.curlinfo_response_code().
+
+module curlshim
+
+export extern fun [dll("insty_curl_shim.dll")] insty_setopt_long(void* h, i32 opt, i32 v) -> i32
+export extern fun [dll("insty_curl_shim.dll")] insty_setopt_ptr(void* h, i32 opt, void* v) -> i32
+export extern fun [dll("insty_curl_shim.dll")] insty_setopt_str(void* h, i32 opt, text v) -> i32
+export extern fun [dll("insty_curl_shim.dll")] insty_setopt_off(void* h, i32 opt, i64 v) -> i32
+export extern fun [dll("insty_curl_shim.dll")] insty_getinfo_long(void* h, i32 info, i32* v) -> i32
+export extern fun [dll("insty_curl_shim.dll")] insty_getinfo_off(void* h, i32 info, i64* v) -> i32
+export extern fun [dll("insty_curl_shim.dll")] insty_getinfo_ptr(void* h, i32 info, void* v) -> i32
