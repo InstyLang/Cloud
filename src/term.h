@@ -38,8 +38,27 @@ namespace detail {
 #endif
     }
 
-    inline bool enableAnsi() {
 #if defined(_WIN32)
+inline UINT& oldOutputCp() {
+    static UINT v = 0;
+    return v;
+}
+inline void restoreOutputCp() {
+    if (oldOutputCp() != 0) SetConsoleOutputCP(oldOutputCp());
+}
+#endif
+
+    inline bool consoleSetup() {
+#if defined(_WIN32)
+        // Tree glyphs are UTF-8; legacy consoles default to CP437/850 and
+        // render them as mojibake ("Γö£ΓöÇ" for "├─"). Switch to UTF-8 for
+        // the session (restored on exit), and enable VT processing for color.
+        const UINT oldCp = GetConsoleOutputCP();
+        if (oldCp != 65001 /* CP_UTF8 */) {
+            if (!SetConsoleOutputCP(65001)) return false;
+            oldOutputCp() = oldCp;
+            std::atexit(restoreOutputCp);
+        }
         HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode = 0;
         if (!GetConsoleMode(h, &mode)) return false;
@@ -52,7 +71,7 @@ namespace detail {
     inline bool colorDefault() {
         if (std::getenv("NO_COLOR") || std::getenv("CLOUD_NO_COLOR")) return false;
         if (std::getenv("CI")) return false;
-        return ttyStdout() && enableAnsi();
+        return ttyStdout() && consoleSetup();
     }
 } // namespace detail
 
@@ -176,8 +195,13 @@ private:
     void printChild(const std::string& text, const std::string& suffix,
                     bool last, bool good = true) {
         const bool fancy = color();
-        const char* branch = last ? (fancy ? "└─ " : "`- ") : (fancy ? "├─ " : "+- ");
-        const char* mark = good ? (fancy ? "✓" : "v") : (fancy ? "✗" : "x");
+        // UTF-8 tree glyphs as hex escapes: correct regardless of the source
+        // encoding MSVC assumes (no /utf-8 in the build).
+        const char* branch = last
+            ? (fancy ? "\xE2\x94\x94\xE2\x94\x80 " : "`- ")
+            : (fancy ? "\xE2\x94\x9C\xE2\x94\x80 " : "+- ");
+        const char* mark = good ? (fancy ? "\xE2\x9C\x93" : "v")
+                                : (fancy ? "\xE2\x9C\x97" : "x");
         std::fprintf(stdout, "%s%s %s%s%s %s%s%s%s\n", style(kDim), branch,
                      good ? style(kGreen) : style(kRed), mark, style(kReset),
                      text.c_str(), style(kDim), suffix.c_str(), style(kReset));
