@@ -1,5 +1,7 @@
 #include <cloudServer/core.hpp>
 
+#include "term.h"
+
 #include <curl/curl.h>
 #include <zlib.h>
 
@@ -71,6 +73,7 @@ struct ProjectConfig {
     std::string linker;
     std::vector<std::string> moduleSearchPaths;
     std::map<std::string, std::string> dependencies;
+    bool coloredOutput = true;   // [diagnostics] colored_output
 };
 
 struct PackageSpec {
@@ -330,6 +333,8 @@ ProjectConfig loadProjectConfig(const fs::path& configPath) {
             }
         } else if (section == "dependencies") {
             config.dependencies[key] = value;
+        } else if (section == "diagnostics" && key == "colored_output") {
+            config.coloredOutput = (value != "false");
         }
     }
 
@@ -1109,7 +1114,8 @@ std::optional<LockEntry> findLockEntry(const std::string& scopedName) {
     return std::nullopt;
 }
 
-void syncInstalledModules(bool verbose = false) {
+int syncInstalledModules(bool verbose = false) {
+    int staged = 0;
     fs::path moduleDir = ".cloud/modules";
     fs::remove_all(moduleDir);
     createDirectory(moduleDir);
@@ -1154,11 +1160,13 @@ void syncInstalledModules(bool verbose = false) {
 
             createDirectory(target.parent_path());
             fs::copy_file(file.path(), target, fs::copy_options::overwrite_existing);
+            ++staged;
             if (verbose) {
                 std::println("Staged dependency module: {}", target.string());
             }
         }
     }
+    return staged;
 }
 
 // Copies each installed dependency's vendored native binaries for the active
@@ -1166,7 +1174,8 @@ void syncInstalledModules(bool verbose = false) {
 // them at runtime (Windows: the DLL sits beside the exe; this is what makes
 // FFI-binding packages zero-install for consumers). Pure-Insty packages have
 // no bin/ and contribute nothing.
-void stageDependencyBinaries(const std::string& target, const fs::path& outputDir, bool verbose) {
+int stageDependencyBinaries(const std::string& target, const fs::path& outputDir, bool verbose) {
+    int staged = 0;
     for (const auto& entry : readLockFile()) {
         fs::path binDir = fs::path(".cloud/libs") / entry.owner / entry.packageName / entry.version / "bin" / target;
         if (!fs::exists(binDir)) {
@@ -1178,15 +1187,19 @@ void stageDependencyBinaries(const std::string& target, const fs::path& outputDi
             }
             fs::path dest = outputDir / file.path().filename();
             fs::copy_file(file.path(), dest, fs::copy_options::overwrite_existing);
+            ++staged;
             if (verbose) {
                 std::println("Staged dependency binary: {}", dest.string());
             }
         }
     }
+    return staged;
 }
 
 void buildProject(const ParsedArgs& args) {
+    const auto t0 = std::chrono::steady_clock::now();
     ProjectConfig config = loadProjectConfig(configFilePath(args));
+    term::setColorPref(config.coloredOutput);
     // Command-line --target/--linker override config.toml for this build.
     if (args.values.find("--target") != args.values.end()) {
         config.target = optionValue(args, "--target");
@@ -1202,7 +1215,11 @@ void buildProject(const ParsedArgs& args) {
     }
 
     createDirectory(outputDir);
-    syncInstalledModules(args.verbose);
+    term::Stepper tree(config.projectName);
+
+    const int modules = syncInstalledModules(args.verbose);
+    tree.instant("stage modules" +
+                 (modules > 0 ? " (" + std::to_string(modules) + ")" : ""));
 
     fs::path executablePath = outputDir / config.projectName;
 #if defined(_WIN32)
@@ -1246,20 +1263,27 @@ void buildProject(const ParsedArgs& args) {
         std::println("Running: {}", command);
     }
 
-    int result = runSystemCommand(command);
-    if (result != 0) {
+    int result;
+    tree.begin("compile " + mainPath.filename().string());
+    result = runSystemCommand(command);
+    if (result == 0) {
+        tree.ok();
+    } else {
+        tree.fail();
         throw std::runtime_error("build failed with exit code: " + std::to_string(result));
     }
 
     if (config.outputFormat == "executable") {
-        stageDependencyBinaries(config.target, outputDir, args.verbose);
+        const int bins = stageDependencyBinaries(config.target, outputDir, args.verbose);
+        tree.instant("stage binaries" +
+                     (bins > 0 ? " (" + std::to_string(bins) + ")" : ""), true);
     }
 
-    std::println("Build successful!");
     if (config.outputFormat == "executable") {
-        std::println("Executable: {}", executablePath.string());
+        term::ok("Build successful: " + executablePath.string() +
+                 " (" + term::since(t0) + ")");
     } else {
-        std::println("Object files in: {}", outputDir.string());
+        term::ok("Objects in: " + outputDir.string() + " (" + term::since(t0) + ")");
     }
 }
 
@@ -2874,7 +2898,7 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& error) {
         curl_global_cleanup();
-        std::println(stderr, "Error: {}", error.what());
+        term::err(error.what());
         return 1;
     }
 }
