@@ -2,7 +2,7 @@
 
 [project]
 name = "@ecx/glad"
-version = "3.3.0"
+version = "3.3.1"
 description = "FFI bindings for OpenGL 3.3 core (glad-generated header, bound by insbind): GL types and ~2000 constants, with the vendored loader library -- GL entry points resolve via wglGetProcAddress + fnCall"
 authors = ["ecx"]
 license = "MIT"
