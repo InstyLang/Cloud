@@ -699,9 +699,11 @@ colored_output = true
     std::string gitignoreContent = R"(# Build artifacts
 .cloud/objects/
 .cloud/modules/
-*.ll
+*.o
+*.obj
 *.out
 *.exe
+*.wasm
 
 # IDE
 .vscode/
@@ -737,26 +739,26 @@ Thumbs.db
 ## Common Commands
 
 ```bash
-cloud build
-cloud run
+cloud build [--release] [--silent] [--verbose] [--target <name>]
+cloud run [--release] [--silent] [--verbose]
 cloud clean
 cloud test
-cloud install @owner/package
+cloud install @owner/package[@version]
+cloud uninstall @owner/package
 cloud update
+cloud list
 cloud publish --name @owner/package --version 0.1.0
-cloud upgrade
+cloud yank @owner/package --version 0.1.0
+cloud upgrade [--check] [--force]
 ```
-
-`cloud update` installs this project's dependencies; `cloud upgrade` updates
-the toolchain itself (`insty`, `cloud`, `insty-lsp` and the standard library).
-Use `cloud upgrade --check` to only report what is available.
 
 Useful environment variables:
 
 - `INSTY_COMPILER` - Override compiler path used by Cloud.
 - `CLOUD_CONFIG` - Override default `config.toml` path.
-- `CLOUD_REGISTRY_URL` - Override package registry URL.
+- `CLOUD_REGISTRY_URL` - Override package registry URL (default `https://pkg.insty.land`).
 - `CLOUD_TOKEN` - Registry bearer token.
+- `CLOUD_TOOLCHAIN_URL` - Override toolchain asset host for upgrade.
 - `CLOUD_NO_UPDATE_CHECK` - Disable the daily toolchain update check.
 
 ## Compiler Commands
@@ -782,6 +784,7 @@ Compiler flags currently useful for OS/dev work:
 - `--raw-binary` - Emit flat binary for ELF targets.
 - `--multiboot2` - Add Multiboot2 header object for x86/x86_64 ELF kernels.
 - `--panic abort|handler` and `--panic-handler <symbol>` - Panic strategy: `abort` traps; `handler` calls the given noreturn symbol. Overrides target spec `panic`/`panic_handler` keys.
+- `--bounds-check` - Emit runtime range checks on slice/array indexing and sub-slicing.
 
 ## `config.toml`
 
@@ -792,15 +795,17 @@ Cloud reads these sections:
 name = "app"
 version = "0.1.0"
 main = "src/main.ins"
-module = "main"
 
 [compiler]
-optimization_level = 0
-output_format = "executable"
+target = "x86_64_windows"      # optional target override
+# linker = "ld.lld"            # optional linker executable override
 
 [paths]
 module_search_paths = [".", "src"]
 output_dir = ".cloud/objects"
+
+[diagnostics]
+colored_output = true          # toggle ANSI colored live build tree output
 
 [dependencies]
 # "@owner/package" = "^1.0.0"
@@ -813,9 +818,12 @@ the compiler, in the `AGENTS.md` beside the `insty` toolchain, and that copy is 
 one kept current and checked against the compiler -- its examples are compiled as
 part of the compiler's own test pass. A per-project copy would drift instead.
 
-Look there for: types and literals, structs/classes/enums, sum types and `switch`,
-generics, slices, `for`-in, `.insize` / `.inalign`, the builtin list, the standard
-library layout, compile-time `#if` and `@targetIs`, the unsafe boundary, volatile
+Look there for: types and literals (including raw strings \`...\` and byte slices b\"...\"),
+first-class function types (`func<...>`), type aliases (`type Name = TargetType`),
+tuples & destructuring, UFCS (`x.f(y)`), comptime functions (`[comptime(on)]`),
+compile-time file embeds (`@embedFile`/`@embedBytes`), structs/classes/enums,
+sum types and `switch`, generics, slices, `for`-in, `.insize` / `.inalign`, builtins,
+standard library layout, compile-time `#if` and `@targetIs`, unsafe boundaries, volatile
 and atomics, inline `asm`, freestanding/OS development, custom target specs, and
 the WebAssembly target.
 
@@ -856,14 +864,14 @@ Read `AGENTS.md` first. It is the canonical project and language reference gener
 
 - Use `cloud build` for normal verification.
 - Use `cloud run` only when the program is expected to be a hosted executable.
-- Use `insty --emit-llvm ...` when checking low-level ABI, target, section, volatile, atomic, or inline assembly behavior.
-- Do not add libc, syscalls, heap allocation, `cimport`, or runtime startup to freestanding/kernel code unless explicitly requested.
+- Use `insty --emit-ast` or `--emit-tokens` when inspecting front-end parsing and AST representation.
+- Do not add libc, syscalls, heap allocation, or runtime startup to freestanding/kernel code unless explicitly requested.
 
 ## Useful Commands
 
 ```bash
-cloud build
-cloud run
+cloud build [--release] [--silent] [--verbose]
+cloud run [--release] [--silent] [--verbose]
 cloud clean
 insty --freestanding --target targets/x86_64-unknown-none.toml src/main.ins -o kernel.elf
 ```
@@ -874,7 +882,9 @@ insty --freestanding --target targets/x86_64-unknown-none.toml src/main.ins -o k
 section ".boot" {
     fun [name(kernel_main), mangle(off), conv(cdecl)] main() -> void {
         unsafe {
-            asm("nop")
+            asm [keep(rax)](
+                mov rax, 42
+            )
         }
     }
 }
@@ -920,8 +930,8 @@ fun indirect(u64 fn_addr) -> i64 {
 
 ## Notes
 
-- `AGENTS.md` contains the fuller docs for Cloud, compiler flags, target specs, freestanding mode, linker behavior, directives, unsafe boundaries, atomics, volatile, and inline asm.
-- Standard library modules ship next to the compiler in `libs/` and are imported by name: `io`, `str`, `math`, `mem` (hosted Linux) and `uefi` (firmware console output on the `x86_64_efi` target; call `uefi.init(image_handle, system_table)` first).
+- `AGENTS.md` contains the full docs for Cloud, language reference, compiler flags, target specs, freestanding mode, linker behavior, directives, unsafe boundaries, atomics, volatile, and inline asm.
+- Standard library modules ship next to the compiler in `libs/` and are imported with `::` namespaces: `std::io`, `std::str`, `std::math`, `std::vec`, `std::string`, `std::fs`, `core::mem`, and target bindings (`windows::*`, `wasi::*`, `instantos::*`, `std::uefi`).
 - Keep generated build output under `.cloud/objects/`.
 - Keep package sources under `.cloud/libs/`; do not vendor generated objects into source.
 
